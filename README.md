@@ -1,836 +1,848 @@
-# junos-mcp-server
+# JMCP Enhanced_CG - beta
 
-A Model Context Protocol (MCP) server for Juniper Junos devices that enables LLM interactions with network equipment.
+Dear all,
 
-## Table of Contents
+This JMCP is based on [junos-mcp-server](https://github.com/Juniper/junos-mcp-server).
+It is strongly encouraged to read the security aspects of the upstream project in the [README](https://github.com/Juniper/junos-mcp-server/blob/main/README.md).
 
-- [junos-mcp-server](#junos-mcp-server)
-  - [Table of Contents](#table-of-contents)
-  - [Important Security Notice](#important-security-notice)
-    - [Security Requirements](#security-requirements)
-    - [Security Best Practices](#security-best-practices)
-  - [Important Configuration Notice](#important-configuration-notice)
-  - [Getting Started](#getting-started)
-    - [Running with uv](#running-with-uv)
-  - [Start Junos MCP Server](#start-junos-mcp-server)
-  - [Configuration](#configuration)
-    - [Config for Claude Desktop (stdio transport)](#config-for-claude-desktop-stdio-transport)
-    - [Config for Claude Desktop (using uv)](#config-for-claude-desktop-using-uv)
-    - [Config for Claude Desktop (Docker container)](#config-for-claude-desktop-docker-container)
-  - [Docker Usage](#docker-usage)
-    - [Build Docker Container](#build-docker-container)
-    - [Running with Default Settings](#running-with-default-settings)
-    - [Overriding Default Arguments](#overriding-default-arguments)
-  - [Junos Device Configuration](#junos-device-configuration)
-  - [Dynamic Device Management with Elicitation](#dynamic-device-management-with-elicitation)
-    - [Elicitation Compatibility Notice](#elicitation-compatibility-notice)
-    - [The `add_device` Tool](#the-add_device-tool)
-      - [How It Works](#how-it-works)
-      - [Security Note](#security-note)
-      - [Example Usage](#example-usage)
-      - [SSH Key Requirements](#ssh-key-requirements)
-      - [Limitations](#limitations)
-  - [VSCode + GitHub Copilot Integration](#vscode--github-copilot-integration)
-    - [Start Your Server](#start-your-server)
-    - [Point to This URL in Your VSCode Config](#point-to-this-url-in-your-vscode-config)
-  - [Authentication for MCP Server Access](#authentication-for-mcp-server-access)
-    - [Authentication Behavior](#authentication-behavior)
-    - [Token Management](#token-management)
-      - [Generate a New Token](#generate-a-new-token)
-      - [List All Tokens](#list-all-tokens)
-      - [Show Token Value (Recovery)](#show-token-value-recovery)
-      - [Revoke a Token](#revoke-a-token)
-    - [Server Authentication Status](#server-authentication-status)
-    - [Client Configuration with Authentication](#client-configuration-with-authentication)
-      - [VSCode Configuration with Token](#vscode-configuration-with-token)
-      - [Testing with curl](#testing-with-curl)
-      - [Docker with Authentication](#docker-with-authentication)
-    - [Security Best Practices](#security-best-practices-1)
-    - [Token File Format](#token-file-format)
-  - [Using MCP Server with Juniper Cloud-Native Router (JCNR)](#using-mcp-server-with-juniper-cloud-native-router-jcnr)
-  - [Developer Guide](#developer-guide)
-    - [Architecture Overview](#architecture-overview)
-    - [How Tools Work](#how-tools-work)
-    - [Adding a New Tool](#adding-a-new-tool)
-      - [Step 1: Create a Handler Function](#step-1-create-a-handler-function)
-      - [Step 2: Register the Handler](#step-2-register-the-handler)
-      - [Step 3: Define Tool Metadata](#step-3-define-tool-metadata)
-    - [Example: Creating a BGP Neighbors Tool](#example-creating-a-bgp-neighbors-tool)
-    - [Using Elicitation in Tools](#using-elicitation-in-tools)
-    - [Best Practices for Tool Development](#best-practices-for-tool-development)
-    - [Using PyEZ for Advanced Operations](#using-pyez-for-advanced-operations)
-    - [Testing Your Tools](#testing-your-tools)
-    - [Debugging Tips](#debugging-tips)
+**Why**
+This modified JMCP improves scale and performance, supports barrier-synced execution, and lets you run M commands on N routers in parallel. Connection pooling reuses persistent sessions for faster collection. With the artifacts feature, JMCP acts as a data broker: it stores full results out-of-band and returns only a small summary plus a pointer (run_id), rather than flooding the LLM context window.
 
-## Important Security Notice
+The enhanced JMCP (pooling + configurable workers) can deliver performance comparable to a dedicated Python collector, which can reduce the need for external Python scripts and keep operations simpler.
 
-> **Warning:** This server enables LLM access to your network infrastructure. Please review these security considerations carefully.
+With very large datasets, there is a risk of exhausting the LLM context window. When that happens, older context can be dropped, which may lead to unreliable behavior (for example, losing parts of the instructions/context). Artifacts reduce this risk during collection by returning only summaries first, while storing the full payload for later phased retrieval. Note that anything you load later still consumes context, so token safety comes from the workflow: collect once, then read only what you need (failures/diff-first), and maintain a compact rolling summary rather than loading everything.
 
-### Security Requirements
+External Python remains best for maximum performance and token efficiency, but enhanced JMCP can reduce the need for extra scripts in some operational scenarios, lowering complexity and improving robustness.
 
-- **Corporate Policy Compliance**: Only use this server if your company's policy allows sending data of Junos devices to LLM services.
+**binaries delta to junos-mcp-server**
+If you already using the junos-mcp-server, then the only item you need from this repo:
+- jmcp_connection_pool.py
+- jmcp.py 
 
-- **Server Security**: Always secure your Junos MCP server before deployment in production environments.
+## overall advantages
+The advantages of this enhanced JMCP are:
+- can run (much) larger batches due to configurable workers (with a good heuristic for default (configurable) allocation of workers to use based cpu-core count)
+- new tool: `execute_junos_command_batch`
+  - the upstream `junos-mcp-server` closes the TCP session om each router after each executed command. That means for every command, a new TCP session must be established to each router.
+  - this enhanced server uses connection pooling, which keeps TCP sessions open and reuses them. Per MCP request, one command gets executed (across many routers).
+- new tool: `execute_junos_commands_batch`
+  - mostly the same as `execute_junos_command_batch`, however it allows multiple commands per MCP request (commands run sequentially per router; routers run in parallel)
+- new capability: explicit command output format (`text` / `json` / `xml`)
+  - some platforms/contexts do not reliably honor CLI pipes like `| display json` through remote execution
+  - JMCP exposes a first-class `format` knob so you can request structured output directly (e.g. `format=json`)
+- new capability: barrier-sync
+  - sometimes it is beneficial to have a command executed on all nodes at (almost) the SAME time
+  - barrier-sync first establishes connections to all routers (with retry logic). Only once connections are settled, it fires the commands over the already existing TCP sessions
+  - great for e.g. `show isis database` to digest LSDB sync issues
+- new capability: artifacts
+  - in short this shall help to avoid trashing the LLM if e.g. a barrier-sync is used for e.g. 250 routers and the JMCP's gathered  data-set would be sent into LLMs context. The artifacts enable the JMCP to save retrieved data locally and allow afterwards via `read_artifact` tool to transfer in smaller batches the data into LLM context. Please note this is the opposite of the JMCP using smaller batches to only query a subset of routers. The artifacts help to make one huge query in parallel, save it locally (or to redis) and then allow the LLM to retrieve full output in smaller chunks.
 
-- **Authentication**: Do **not** use password authentication for production deployments. We strongly recommend using SSH key-based authentication for enhanced security.
 
-- **Deployment Strategy**: Until your MCP server is properly secured, only deploy locally for testing purposes. Do not deploy remote servers in production without proper security measures.
+  ### ASCII overview: JMCP as data-broker (artifacts + Redis)
 
-### Security Best Practices
+  This diagram shows what gets stored (artifact payloads) vs what gets sent back to the LLM.
 
-- Use SSH key authentication instead of passwords
-- Implement proper network access controls
-- Monitor and log all MCP server activities
-- Regular security audits and updates
-- Follow your organization's security policies
+  ```
+                  (1) tool call (batch / multi-command)
 
-## Important Configuration Notice
+     +--------------------+      MCP request      +---------------------+      SSH/NETCONF      +------------------+
+     | LLM / MCP client   |  ------------------>  | JMCP (data broker)  |  ------------------>  | Junos routers     |
+     | (ChatGPT, etc.)    |  <------------------  | + connection pool   |  <------------------  | (crpd*, mx*, ...) |
+     +--------------------+      MCP response     | + workers           |                       +------------------+
+                                                   | + batching tools    |
+                                                   | + response_mode     |
+                                                   | + format=json/xml   |
+                                                   | + barrier_sync      |
+                                                   +----------+----------+
+                                                              |
+                                                              | (2) response_mode=artifact stores full payloads
+                                                              v
+                                           +----------------------------------------------+
+                                           | Artifact storage (out-of-band)               |
+                                           | - Redis (run_id -> JSON blob)                |
+                                           | - disk (artifacts/*.json)                    |
+                                           | - dual (Redis + disk)                        |
+                                           +----------------------------------------------+
 
-> **Warning:** The Junos MCP server supports configuration changes, but please ensure you only use this functionality when you want LLM-generated configurations to be loaded and committed on your Junos router. 
 
-**Always review the configuration being generated by the LLM and only allow tool execution if it's the correct configuration for your use case.**
+  What JMCP sends back to the LLM (same router execution, different shapes):
 
-## Getting Started
+    response_mode=full
+      -> summary + per-router outputs inline (largest, token-heavy)
 
-Get the code.
-```bash
-git clone https://github.com/Juniper/junos-mcp-server.git
-cd junos-mcp-server
-pip install -r requirements.txt
+    response_mode=summary
+      -> only summary/metadata (smallest, but no data to analyze)
+
+    response_mode=artifact
+      -> summary + pointer (run_id)  [full payload is stored in Redis/disk]
+
+
+  Token-safe “collect once, inspect subsets later” loop:
+
+    LLM calls execute_* with response_mode=artifact
+      -> gets run_id
+    LLM calls read_artifact(run_id, mode=diff|failures|full, router_names/offset/limit)
+      -> fetches only the slice/representation needed for analysis
+  ```
+
+
+# Usage and understanding of the knobs
+This enhanced MCP has a couple of knobs, e.g. **artifact_backend** and **response_mode**
+
+The `artifact_backend` can be configured to files, redis or both. By default it is set to files. If finally any data is saved locally, is fully dependant on the `response_mode knob`.
+
+## response_mode
+**response_mode=full**
+That's the same behavior as in today's junos-mcp-server: for any query, JMCP returns the full output to the LLM.
+
+**response_mode=summary**
+Only a brief summary (how many fails, success, time taken) is signaled back to the LLM. Might be good for testing, prototyping and makes most sense if its upfront known that the data retrieved from JMCP might trash the context-window. Summary is the default mode.
+
+**response_mode=artifact**
+Triggers sending summary-report and JMCP persists the full payload to the configured artifact backend and returns only a summary + `run_id`.
+
+
+## examples`
+
+**response_mode summary**
+Prompt: `get the version from all routers crpd1 and crpd2. tool execute_junos_command_batch`
+This is exact todays MCP behavior
+
+**response_mode artifact**
+Now lets save into disk and protect the LLm context-window of getting verwheelmed by 250 routers sending their "show isis database"
+Prompt: `get isis database from all routers starting with crpd. tool execute_junos_command_batch. response_mode = artifact. artifact_backend = redis`
+This is the summary sent back by the JMCP
+```
+Executed execute_junos_command_batch for show isis database on all crpd* routers with response_mode=artifact and artifact_backend=redis.
+
+Summary: total_routers=48, successful=48, failed=0, duration=3.319s
+New Redis artifact run_id: 20260127T180529Z-7f5a55c7
 ```
 
-### Running with uv
-If you're using [uv](https://github.com/astral-sh/uv), you can run the server directly:
-```bash
-uv run python jmcp.py -f devices.json -t stdio
+As a next step 2 fully different options exist. Shall the JMCP sent full data to the LLM (which all contributes to context window), or just a diff. For some use cases the author observed a factor if 13 on token saving, when using the diff. But lets start with retrieve full data from thew JMCP:
+
+Example 1 - lets retrieve full cli output
+```markdown
+“Using JMCP, we will analyze ISIS LSDB sync token-safely. retrieve most recent run_id
+
+**Rules:**
+
+Always read data in chunks of 20 routers using read_artifact(mode="full").
+Do NOT keep raw outputs in memory; immediately reduce each chunk to a compact summary.
+Maintain a single rolling report called LSDB_SYNC_REPORT with only:
+baseline LSP inventory (LSP-ID → seq/checksum if present)
+per-LSP min/max lifetime/age across routers (track min_router/max_router)
+routers flagged as outliers (missing LSPs, seq mismatch, lifetime outside threshold)
+After each chunk, output only:
+updated LSDB_SYNC_REPORT (compact)
+next read_artifact call parameters.
+Start now:
+Call read_artifact with:
+
+use tool list_artifacts  to get  most actual run_id
+mode="full"
+router_offset=0
+router_limit=20
+artifact_backend="redis"
+Then parse each router’s show isis database text and update LSDB_SYNC_REPORT.
+Heuristics:
+
+Pick baseline as the first router in the first chunk.
+LSDB sync OK if: LSP set identical and sequence numbers identical (ignore volatile columns).
+Lifetime check: flag if lifetime differs by more than 120s from the fleet median for that LSP (or if lifetime < 300s).
+Proceed until all routers are processed.”
 ```
 
-## Start Junos MCP Server
+Example 2 - getting just a diff back from the JMCP, not the full output
 
-```bash
-$ python3.11 jmcp.py --help
-Junos MCP Server
+A massive token-saving can be achieved when JMCP returns only a diff/grouping view, instead of the full per-router output. This works especially well for outputs like `show isis database`.
 
-options:
-  -h, --help            show this help message and exit
-  -f DEVICE_MAPPING, --device-mapping DEVICE_MAPPING
-                        the name of the JSON file containing the device mapping
-  -H HOST, --host HOST  Junos MCP Server host
-  -t TRANSPORT, --transport TRANSPORT
-                        Junos MCP Server transport
-  -p PORT, --port PORT  Junos MCP Server port
+```markdown
+Using JMCP, we will analyze ISIS LSDB sync token-safely (diff-first). Retrieve the most recent run_id and then request a diff view.
+
+Rules:
+
+- Prefer `read_artifact(mode="diff")` first.
+- Build a compact LSDB_SYNC_REPORT from grouping + diffs (do not store raw outputs).
+- Treat LSDB sync OK if LSP set is identical and sequence/checksum are identical (ignore volatile columns like Lifetime).
+- If you need lifetime checks, do a small targeted follow-up with `read_artifact(mode="full")` for only a few routers.
+
+Start now:
+
+1) Call `list_artifacts` to get the newest run_id (do not load payloads):
+  - tool: "execute_junos_command_batch"
+  - label_contains: "isis"
+  - limit: 1
+  - artifact_backend: "redis"
+
+2) Call `read_artifact` for that run_id:
+  - mode: "diff"
+  - artifact_backend: "redis"
+  - diff_max_groups: 10
+  - diff_max_routers_per_group: 20
+  - diff_max_diff_chars: 2000
+  - (omit diff_include_diffs to let auto heuristics decide)
+
+3) Output only:
+  - LSDB_SYNC_REPORT (compact)
+  - next suggested read_artifact(...) parameters (only if needed)
 ```
 
-Junos MCP server supports both streamable-http and stdio transport. Do not use --host with stdio transport.
+Note: not every CLI output benefits from diff mode. Commands with lots of volatile counters/timestamps (e.g. `show interfaces extensive`) may produce large diffs or diffs that are auto-suppressed.
 
-## Configuration
 
-### Config for Claude Desktop (stdio transport)
+## format
+JMCP supports an explicit `format` knob for the Junos execution tools:
+
+- `format=text` (default): returns plain CLI text
+- `format=json`: requests JSON output from the device and returns it as JSON text
+- `format=xml`: requests XML output from the device and returns it as text
+
+Supported tools:
+- `execute_junos_command`
+- `execute_junos_command_batch`
+- `execute_junos_commands_batch`
+
+Why this exists:
+- Relying on CLI pipes like `| display json` can be inconsistent depending on platform and how the command is executed.
+- With `format=json`, JMCP requests structured output directly and normalizes it into a stable JSON string for downstream processing/token counting.
+
+Example prompt:
+`Using JMCP: run execute_junos_command_batch on routers [crpd1] with command: show isis database, format=json, timeout=120, response_mode=full. Summarize the number of LSPs and highlight any anomalies.`
+
+
+
+## Quickstart: one-liner prompts (no artifacts)
+
+Copy/paste these as-is into your LLM chat after JMCP is connected (adjust commands/timeouts as needed). These prompts explicitly use `get_router_list` so you don’t have to manually maintain router lists. First examples do not use artifacts, means the JMCP 
+
+- "Using JMCP: call get_router_list, then call execute_junos_command_batch with router_names=<that list>, command='show version brief', timeout=60, response_mode='summary'."
+- "Using JMCP: run execute_junos_command_batch on routers [acx7100, mx204] with command: show interfaces terse, timeout=60, response_mode=summary."
+- "Using JMCP: run execute_junos_command_batch on routers [crpd1] with command: show isis database, format=json, timeout=120, response_mode=full. Then summarize the LSP count and highlight any anomalies."
+- "Using JMCP: call get_router_list, then run execute_junos_commands_batch with commands: [show isis database, show isis adjacency], timeout=120, response_mode=summary; summarize results and show only failures."
+- "Using JMCP: run execute_junos_commands_batch on routers [crpd1] with commands: [show isis adjacency, show isis database], format=json, timeout=120, response_mode=full. Summarize adjacency state and any LSDB deltas." 
+- "Repeat the previous batch, but enable barrier_sync=true (barrier_policy=proceed, preconnect_timeout=30, preconnect_retries=2, preconnect_backoff_seconds=1) for a near-simultaneous snapshot."
+- "Run the same batch with barrier_sync=true and barrier_policy=strict so the operation aborts if any router cannot preconnect."
+
+## Quickstart: one-liner prompts (with artifacts)
+
+Artifacts are for large outputs: JMCP stores full results and returns only a pointer (`run_id`) so the LLM context window stays small.
+
+### Option A (per call): no config changes
+
+- "Using JMCP: call get_router_list, then run execute_junos_commands_batch with commands: [show isis database, show isis adjacency], timeout=120, response_mode=artifact, artifact_label=isis-smoke. Then immediately call read_artifact on the returned run_id in mode=failures (max_output_chars=2000)."
+- "Using JMCP: call get_router_list, then run execute_junos_commands_batch with commands: [show isis database, show isis adjacency], format=json, timeout=120, response_mode=artifact, artifact_label=isis-json. Then call read_artifact on the returned run_id in mode=diff (diff_include_diffs=true)."
+- "List the last 10 artifacts for tool=execute_junos_commands_batch with label_contains=isis (do not load full payloads)."
+
+### Option B (defaults via mcp.json): recommended for daily use
+
+If you want artifacts by default (so you don’t have to set `response_mode=artifact` every time), add these env vars to your JMCP server entry in your VS Code `mcp.json`.
+
+Minimal (disk artifacts) – snippet to merge into your JMCP server entry:
+
+```json
+{
+  "env": {
+    "JMCP_BATCH_RESPONSE_MODE": "artifact",
+    "JMCP_ARTIFACT_BACKEND": "disk"
+  }
+}
+```
+
+Redis artifacts (requires a reachable Redis; defaults work for local Homebrew `brew services start redis`) – snippet to merge into your JMCP server entry:
+
+```json
+{
+  "env": {
+    "JMCP_BATCH_RESPONSE_MODE": "artifact",
+    "JMCP_ARTIFACT_BACKEND": "redis",
+    "JMCP_ARTIFACT_REDIS_HOST": "127.0.0.1",
+    "JMCP_ARTIFACT_REDIS_PORT": "6379",
+    "JMCP_ARTIFACT_REDIS_DB": "0"
+  }
+}
+```
+
+Optional knobs you might add later:
+- `JMCP_ARTIFACT_GZIP=1` (compress artifact payloads)
+- `JMCP_ARTIFACT_REDIS_TTL_SECONDS=604800` (expire after 1 week)
+- `JMCP_ARTIFACT_REDIS_MAX_BYTES=50000000` (hard cap per artifact)
+
+Once configured, you can use the same batching prompts as above; JMCP will return summaries + an artifact pointer by default.
+
+### Full mcp.json example (stdio)
+
+Paste a complete server entry. In VS Code, the top-level key is typically `mcpServers`.
 
 ```json
 {
   "mcpServers": {
     "jmcp": {
-      "type": "stdio",
-      "command": "python3",
-      "args": ["jmcp.py", "-f", "devices.json", "-t", "stdio"]
+      "command": "${workspaceFolder}/.venv/bin/python",
+      "args": ["${workspaceFolder}/jmcp.py", "-t", "stdio", "-f", "${workspaceFolder}/devices.json"],
+      "env": {
+        "JMCP_BATCH_RESPONSE_MODE": "summary",
+        "JMCP_ARTIFACT_BACKEND": "disk"
+      }
     }
   }
 }
 ```
 
-### Config for Claude Desktop (using uv)
+To enable artifacts by default, change:
+- `JMCP_BATCH_RESPONSE_MODE` to `artifact`
+- `JMCP_ARTIFACT_BACKEND` to `disk` or `redis`
+
+Redis example (defaults for local Homebrew Redis):
 
 ```json
 {
-  "mcpServers": {
-    "jmcp": {
-      "type": "stdio",
-      "command": "uv",
-      "args": ["run", "python", "jmcp.py", "-f", "devices.json", "-t", "stdio"]
+  "env": {
+    "JMCP_BATCH_RESPONSE_MODE": "artifact",
+    "JMCP_ARTIFACT_BACKEND": "redis",
+    "JMCP_ARTIFACT_REDIS_HOST": "127.0.0.1",
+    "JMCP_ARTIFACT_REDIS_PORT": "6379",
+    "JMCP_ARTIFACT_REDIS_DB": "0"
+  }
+}
+```
+
+After changing `mcp.json`, restart the MCP server in VS Code so the new environment is applied.
+
+Note: if you set `JMCP_ARTIFACT_BACKEND=redis|dual`, the Python environment used to run JMCP must have the `redis` package installed.
+
+
+---
+
+## Latest Configuration
+
+### **Connection Pool: ENABLED BY DEFAULT** ✓
+- **Default behavior:** Connection pool ON for all operations
+- **Performance:** 15-100x faster than non-pooled
+- **TCP sessions:** 1 per router (reused across all commands)
+- **Override:** Use `--disable-connection-pool` to disable (not recommended)
+
+### **Workers-Per-Core Model** ✓
+- **Replaced:** `--max-workers` → `--workers-per-core`
+- **Default (if omitted):** `ceil(cpu_cores × 1.5)` workers (floor=8, cap=80)
+- **Calculation (if set):** `total_workers = ceil(cpu_cores × workers_per_core)`
+- **Override:** `JMCP_MAX_WORKERS` env var for absolute count
+
+### **CLI Arguments**
+```bash
+python jmcp.py -h
+
+Options:
+  -f, --device-mapping        Device configuration file (default: devices.json)
+  -H, --host                  Server host (default: 127.0.0.1)
+  -t, --transport             Protocol: streamable-http or stdio
+  -p, --port                  Server port (default: 30030)
+  --workers-per-core          Workers per CPU core (float, optional; default uses heuristic ceil(cpu*1.5), floor=8, cap=80)
+  --disable-connection-pool   Disable connection pool (not recommended)
+  --idle-timeout              Pool idle timeout in seconds (default: 300)
+  --health-check-interval     Pool health check interval (default: 30)
+```
+
+### Device Inventory Setup
+
+- Copy the template: `cp devices.example.json devices.json`
+- Edit `devices.json` with your real routers and credentials
+- `devices.json` is intentionally ignored by git
+
+---
+
+## Stress Test Results
+
+**Test Date:** January 22, 2026  
+**Test Evidence:** See docs (links below)  
+**Result:** ✅ ALL TESTS PASSED
+
+### Test Coverage
+
+| Test | Result | Details |
+|------|--------|---------|
+| **Startup Verification** | ✅ PASS | All 5 configurations start successfully |
+| **Device Configuration** | ✅ PASS | 50 devices loaded from devices.json (stress-test inventory) |
+| **Connection Pool Module** | ✅ PASS | JunosConnectionPool class available |
+| **Help Output** | ✅ PASS | All 7 sections + 4 arguments documented |
+
+### Startup Configurations Tested
+
+1. **Default (if omitted):** ceil(14 cores × 1.5) = 21 workers ✓
+2. **Workers-per-core 20:** ceil(14 cores × 20) = 280 workers ✓
+3. **Workers-per-core 5:** ceil(14 cores × 5) = 70 workers ✓
+4. **Custom idle timeout:** --idle-timeout 600 ✓
+5. **Pool disabled:** --disable-connection-pool ✓
+
+---
+
+## TCP Session Behavior
+
+### Example: 10 routers × 20 commands
+
+**WITH CONNECTION POOL (default):**
+- **TCP sessions:** 10 total (1 per router)
+- **Reuse:** Each router's 20 commands use same session
+- **TIME_WAIT:** Only 10 sockets when sessions expire
+- **Speed:** 15-100x faster
+
+**WITHOUT CONNECTION POOL:**
+- **TCP sessions:** 200 total (20 per router)
+- **Reconnections:** New connection per command
+- **TIME_WAIT:** 200 sockets created immediately
+- **Speed:** Very slow (1-2 seconds reconnection per command)
+
+**EXECUTION MODEL:**
+- **Parallel:** All 10 routers execute simultaneously
+- **Sequential:** Each router's 20 commands run one-by-one
+- **Total time:** ≈ time for 20 commands on slowest router (NOT 10×20)
+
+**SUCCESS / FAILURE SEMANTICS (Batch Tools):**
+- For `execute_junos_command_batch` and `execute_junos_commands_batch`, a command is counted as **failed** if the returned output looks like an error string (e.g. starts with `Connection error`, `An error occurred`, or `Error:`).
+- This matters for platforms like cRPD where unsupported commands can return an RPC error message; those are now reported as failures (instead of being counted as successful just because a string was returned).
+
+---
+
+## Artifacts + Response Modes (Token-Safe Batch Runs)
+
+JMCP supports **response modes** for the batch tools so you can avoid returning huge raw outputs into the client/LLM context.
+
+### Supported Modes
+
+Applies to:
+- `execute_junos_command_batch` (N routers × 1 command)
+- `execute_junos_commands_batch` (N routers × M commands)
+
+Modes:
+- `full` (default): include full outputs in the tool response
+- `summary`: return a compact summary + metadata (and failures only)
+- `artifact`: **persist full results to the configured artifact backend** and return only summary + an `artifact` pointer
+
+Supported artifact backends:
+- `disk`: write JSON files under the artifact directory
+- `redis`: write JSON blobs + metadata to Redis
+- `dual`: write to both (Redis primary; disk best-effort secondary)
+
+### Where Artifacts Are Written
+
+Artifact backend selection (priority order is tool arg → env var → file → default):
+1. tool argument `artifact_backend`
+2. env var `JMCP_ARTIFACT_BACKEND`
+3. file `.jmcp_artifact_backend` (next to `jmcp.py`)
+4. default: `disk`
+
+Artifact directory resolution order:
+1. tool argument `artifact_dir`
+2. env var `JMCP_ARTIFACT_DIR`
+  - use-case: huge outputs (e.g. `show isis database`) across many routers without flooding the LLM context window
+  - example math: 250 routers × ~1400 tokens/router ≈ ~350k tokens (this can exceed the context window quickly)
+  - solution: run the batch with `response_mode=artifact`
+    - JMCP stores the full results to an artifact backend (disk / Redis / dual)
+    - the LLM receives only a small summary + a pointer (`run_id`)
+    - later, the LLM can query the stored data in a controlled/token-safe way
+  - artifact tools:
+    - `list_artifacts` (find artifacts without loading payloads)
+    - `read_artifact` (read one artifact by `run_id`)
+  - `read_artifact` modes (what gets sent back to the LLM):
+    - **DIFF** (`mode=diff`): token-safe triage (groups identical outputs and shows a few diffs vs a baseline)
+      - diffs are auto-suppressed when they would explode tokens (rewrite-like diffs or diffs larger than the raw output)
+      - note: DIFF is great to spot structural LSDB differences (missing LSPs / different sequence/checksum). It is *not* a good way to compute fleet-wide min/max lifetime deviation.
+    - **FULL** (`mode=full`): returns the full stored payload for the selected routers (can be large)
+  - phased loading (token-safe): use `router_offset` + `router_limit` (or `router_names`) to read the artifact in chunks
+
+If you specifically want lifetime deviation stats, use chunked FULL reads and aggregate in the LLM (or an external script):
+
+```text
+read_artifact(mode='full', router_offset=0, router_limit=5)
+```
+
+Have the LLM maintain a rolling table like:
+
+`lsp-id -> {min_lifetime, max_lifetime, min_router, max_router}`
+
+Then increment `router_offset` and repeat until done.
+
+### Artifact Tools
+
+JMCP exposes tools to work with artifacts (useful when running in `artifact` mode):
+
+- `get_server_settings`: shows effective batch mode + artifact dir + worker/pool status
+- `list_artifacts`: lists artifacts from the configured backend without loading full payloads
+- `read_artifact`: loads one artifact by `run_id` (backend) or `artifact_path` (disk) and returns a compact view
+
+`read_artifact` view modes:
+- `auto`: chooses `full` vs `diff` based on size/router count (good default)
+- `metadata`: minimal header info
+- `summary`: summary + failure metadata (LLM-friendly)
+- `failures`: only failing routers/commands (truncated outputs)
+- `diff`: token-safe grouping of outputs + truncated diffs against a baseline (spot anomalies without dumping all output)
+- `full`: entire artifact JSON (can be large)
+
+`diff` mode knobs (optional):
+- `diff_include_diffs`: if true, force unified diffs; if false, disable diffs; if omitted, server may auto-suppress rewrite-level diffs
+- `diff_max_groups` (default 3): how many variant groups to include (and optionally diff) vs baseline
+- `diff_max_diff_chars` (default 3000): truncation limit per diff text
+- `diff_max_routers_per_group` (default 10): how many router names to list per variant
+- `diff_context_lines` (default 10): unified diff context lines
+
+Notes on `diff_include_diffs` auto mode:
+- Some commands (notably `show interfaces extensive`) include volatile counters/timestamps that can make unified diffs *bigger* than the raw output (“rewrite diffs”).
+- If you omit `diff_include_diffs`, JMCP runs in **auto** mode: it always returns grouping, but only includes unified diffs when the variant is sufficiently similar to the baseline.
+- When a diff is suppressed you’ll still get a diff entry with `omitted: true`, a `reason` (e.g. `rewrite_diff_suppressed` or `diff_larger_than_variant`), and a `similarity` score when relevant.
+
+### Example: Run in `artifact` Mode + Fetch Failures
+
+1) Run a large batch but keep the response small:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "tools/call",
+  "id": 1,
+  "params": {
+    "name": "execute_junos_commands_batch",
+    "arguments": {
+      "router_names": ["r1", "r2", "r3"],
+      "commands": ["show version brief", "show system uptime"],
+      "timeout": 60,
+      "response_mode": "artifact",
+      "artifact_label": "smoke"
     }
   }
 }
 ```
 
-**Note:** Please provide absolute path for jmcp.py and devices.json file.
+The response includes a compact summary plus an `artifact` pointer (not the full outputs).
+Capture `artifact.run_id` (and optionally `artifact.path`).
 
-### Config for Claude Desktop (Docker container)
+2) List recent artifacts:
 
 ```json
 {
-  "mcpServers": {
-    "jmcp": {
-      "type": "stdio",
-      "command": "/usr/local/bin/docker",
-      "args": [
-        "run",
-        "--rm",
-        "-i",
-        "-v",
-        "devices.json:/app/config/devices.json",
-        "-v",
-        "vsrx_keypair.pem:/app/config/vsrx_keypair.pem",
-        "junos-mcp-server:latest"
-      ]
+  "jsonrpc": "2.0",
+  "method": "tools/call",
+  "id": 2,
+  "params": {
+    "name": "list_artifacts",
+    "arguments": {
+      "tool": "execute_junos_commands_batch",
+      "label_contains": "smoke",
+      "limit": 10
     }
   }
 }
 ```
-## Docker Usage
 
-### Build Docker Container
-
-```bash
-$ docker build -t junos-mcp-server:latest .
-```
-
-### Running with Default Settings
-
-By default, the Docker container runs with stdio transport:
-
-```bash
-$ docker run --rm -it -v /path/to/your/devices.json:/app/config/devices.json junos-mcp-server:latest
-```
-
-This uses the default command: `python jmcp.py -f /app/config/devices.json -t stdio`
-
-### Overriding Default Arguments
-
-You can override any arguments by specifying the full command:
-
-**For stdio transport:**
-```bash
-$ docker run --rm -it -v /path/to/your/devices.json:/app/config/devices.json junos-mcp-server:latest python jmcp.py -f /app/config/devices.json -t stdio
-```
-
-**For streamable-http transport:**
-```bash
-$ docker run --rm -it -v /path/to/your/devices.json:/app/config/devices.json -p 30030:30030 junos-mcp-server:latest python jmcp.py -f /app/config/devices.json -t streamable-http -H 0.0.0.0
-```
-
-**For streamable-http with custom port:**
-```bash
-$ docker run --rm -it -v /path/to/your/devices.json:/app/config/devices.json -p 8080:8080 junos-mcp-server:latest python jmcp.py -f /app/config/devices.json -t streamable-http -p 8080 -H 0.0.0.0
-```
-
-**Note:** 
-- Always mount your device configuration file using `-v /path/to/your/devices.json:/app/config/devices.json`
-- For streamable-http transport, expose the port using `-p host_port:container_port`
-- Mount any SSH private key files if using key-based authentication (e.g., `-v /path/to/key.pem:/app/config/key.pem`)
-
-Build docker container for Junos MCP Server
-```
-$ docker build -t junos-mcp-server:latest .
-```
-
-**Note:** Mount your config file `devices.json` and mount any other files, in my case I am using pem file for ssh priv key authentication so I am also mounting vsrx_keypair.pem
-
-## Junos Device Configuration
-
-Junos MCP server supports both `password` based auth as well as `SSH key` based authentication (See first 2 routers configs [router-1, router-2]).
+3) Read only failures (LLM-friendly, truncated outputs):
 
 ```json
 {
-    "router-1": {
-        "ip": "ip-addr",
-        "port": 22,
-        "username": "user",
-        "auth": {
-            "type": "password",
-            "password": "pwd"
-        }
-    },
-    "router-2": {
-        "ip": "ip-addr",
-        "port": 22,
-        "username": "user",
-        "auth": {
-            "type": "ssh_key",
-            "private_key_path": "/path/to/private/key.pem"
-        }
-    },
-    "router-3": {
-        "ip": "ip-addr",
-        "port": 22,
-        "username": "user",
-        "ssh_config": "~/.ssh/config_dc",
-        "auth": {
-            "type": "ssh_key",
-            "private_key_path": "/path/to/private/key.pem"
-        }
-    },
-    "router-4": {
-        "ip": "ip-addr",
-        "port": 22,
-        "username": "user",
-        "ssh_config": "/home/user/.ssh/config_jumphost",
-        "auth": {
-            "type": "password",
-            "password": "pwd"
-        }
+  "jsonrpc": "2.0",
+  "method": "tools/call",
+  "id": 3,
+  "params": {
+    "name": "read_artifact",
+    "arguments": {
+      "run_id": "20260127T004712Z-3b791dc1",
+      "mode": "failures",
+      "max_output_chars": 2000
     }
-}
-```
-
-Junos MCP server also provides support for `ProxyCommand`. (See last 2 routers configs [router-3, router-4]), which enables you to access a target device through an intermediary host that supports `netcat`. This is useful when you can only log in to the target device through the intermediate host (jumphost).
-
-This is an example of an SSH config file being used `.ssh/config_jumphost`:
-
-```bash
-# Jumphost VM Connection
-Host jumphost-vm
-  HostName 10.2.11.200
-  User root
-  # Used for MCP server
-  IdentityFile /home/user/.ssh/id_rsa_claude
-  IdentitiesOnly yes
-  StrictHostKeyChecking no
-
-# cRPD Devices (via jump host)
-Host dt-crpd1 dtwin-crpd1 digital-twin-crpd1 clab-digital-twin-eop6-pe1
-    HostName 172.20.20.11
-    User claude
-    IdentityFile c
-    # ProxyJump jumphost-vm # Not working with JunOS MCP
-    ProxyCommand ssh -l root jumphost-vm nc %h 22 2>/dev/null
-    StrictHostKeyChecking no
-```
-
-**Note #1:** `Port` value should be an integer (typically `22` for SSH).
-
-**Note #2:** `IdentityFile` recommendation use full path (e.g `/home/user/.ssh/id_rsa_claude` rather than `~/.ssh/id_rsa_claude`).
-
-## Dynamic Device Management with Elicitation
-
-### Elicitation Compatibility Notice
-
-> **Important:** The elicitation feature currently only works with **VSCode** (using streamable-http transport). Claude Desktop does not yet support elicitation, so the `add_device` tool will not work with Claude Desktop.
-
-### The `add_device` Tool
-
-The Junos MCP server includes a powerful `add_device` tool that allows you to dynamically add new Junos devices without modifying the configuration file. This tool uses MCP's elicitation feature to interactively collect device information.
-
-#### How It Works
-
-When you use the `add_device` tool, it will interactively ask for:
-
-1. **Device Name**: A unique identifier for your device (e.g., "router1-east")
-2. **IP Address**: The device's IP address
-3. **SSH Port**: The SSH port (defaults to 22)
-4. **Username**: The username for authentication
-5. **SSH Key Path**: The path to the SSH private key file on the MCP server
-
-The tool validates each input:
-- Device names must be unique
-- IP addresses must be valid
-- SSH key files must exist and be readable
-- Optional connection test before adding the device
-
-#### Security Note
-
-The `add_device` tool **only supports SSH key authentication**. Password authentication has been disabled for security reasons and because VSCode's elicitation UI doesn't properly mask password fields.
-
-#### Example Usage
-
-In VSCode with GitHub Copilot:
-
-```
-@jmcp Please add a new device to the MCP server
-```
-
-The tool will then guide you through the process:
-
-1. **Enter device name**: `vsrx-lab1`
-2. **Enter IP address**: `10.0.1.100`
-3. **Enter SSH port**: `22` (or press Enter for default)
-4. **Enter username**: `admin`
-5. **Enter SSH key path**: `/home/user/.ssh/junos_key.pem`
-6. **Confirm and optionally test connection**
-
-After successful addition, the device is immediately available for use with all other Junos MCP tools.
-
-#### SSH Key Requirements
-
-- The SSH private key file must exist on the MCP server filesystem
-- The file must be readable by the process running the MCP server
-- For Docker deployments, mount the SSH key file into the container
-
-Example Docker mount:
-```bash
-docker run --rm -it \
-  -v /path/to/devices.json:/app/config/devices.json \
-  -v /path/to/ssh_key.pem:/app/config/ssh_key.pem \
-  -p 30030:30030 \
-  junos-mcp-server:latest \
-  python jmcp.py -f /app/config/devices.json -t streamable-http -H 0.0.0.0
-```
-
-#### Limitations
-
-- **VSCode Only**: Elicitation is not supported in Claude Desktop
-- **SSH Key Only**: No password authentication support
-- **No Persistence**: Added devices are only stored in memory; they will be lost when the server restarts
-- **Timeout**: Users have 5 minutes to respond to each prompt
-
-For Claude Desktop users, devices must still be configured in the `devices.json` file as described in the [Junos device config](#junos-device-config) section.
-
-## VSCode + GitHub Copilot Integration
-
-### Start Your Server
-
-```bash
-$ python3.11 jmcp.py -f devices.json
-[06/11/25 08:26:11] INFO     Starting MCP server 'jmcp-server' with transport 'streamable-http' on http://127.0.0.1:30030/mcp
-INFO:     Started server process [33512]
-INFO:     Waiting for application startup.
-INFO:     Application startup complete.
-INFO:     Uvicorn running on http://127.0.0.1:30030 (Press CTRL+C to quit)
-```
-
-### Point to This URL in Your VSCode Config
-
-```json
-{
-    "mcp": {
-        "servers": {
-            "my-junos-mcp-server": {
-                "url": "http://127.0.0.1:30030/mcp/"
-            }
-        }
-    }
-}
-```
-
-**Note:** You can use VSCode's `Cmd+Shift+P` to configure MCP server.
-
-## Authentication for MCP Server Access
-
-The Junos MCP server supports token-based authentication for secure client access when using streamable-http transport. This prevents unauthorized access to your network infrastructure.
-
-### Authentication Behavior
-
-- **stdio transport** (Claude Desktop): No authentication required - secure by design as it runs locally
-- **streamable-http transport** (VSCode, web clients): Token-based authentication available
-
-### Token Management
-
-The server includes a dedicated token management CLI tool: `jmcp_token_manager.py`
-
-#### Generate a New Token
-
-```bash
-# Basic token generation
-python jmcp_token_manager.py generate --id "vscode-dev"
-
-# With description
-python jmcp_token_manager.py generate --id "vscode-dev" --description "VSCode development environment"
-
-# Example output:
-Generated new token:
-  ID: vscode-dev  
-  Token: jmcp_a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8
-  Description: VSCode development environment
-
-Save this token securely - it won't be shown again!
-```
-
-#### List All Tokens
-
-```bash
-python jmcp_token_manager.py list
-
-# Example output:
-ID                   Description                              Created                  
--------------------------------------------------------------------------------------
-vscode-dev          VSCode development environment           2025-01-28T10:30:00Z     
-prod-client         Production client access                 2025-01-28T09:15:00Z     
-```
-
-#### Show Token Value (Recovery)
-
-```bash
-python jmcp_token_manager.py show --id "vscode-dev"
-
-# Example output:
-Token ID: vscode-dev
-Token: jmcp_a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8
-Description: VSCode development environment
-Created: 2025-01-28T10:30:00Z
-```
-
-#### Revoke a Token  
-
-```bash
-python jmcp_token_manager.py revoke --id "vscode-dev"
-
-# Example output:
-Token 'vscode-dev' has been revoked
-```
-
-### Server Authentication Status
-
-The server automatically detects and enables authentication based on the presence of tokens:
-
-**With tokens configured:**
-```bash
-$ python jmcp.py -f devices.json -t streamable-http
-INFO - Token-based authentication enabled
-INFO - Clients must send 'Authorization: Bearer <token>' header  
-INFO - Use jmcp_token_manager.py to manage tokens
-INFO - Streamable HTTP server started on http://127.0.0.1:30030
-```
-
-**Without tokens configured:**
-```bash
-$ python jmcp.py -f devices.json -t streamable-http  
-WARNING - No .tokens file found - server is open to all clients
-INFO - Create tokens using: python jmcp_token_manager.py generate --id <token-id>
-INFO - Streamable HTTP server started on http://127.0.0.1:30030
-```
-
-### Client Configuration with Authentication
-
-#### VSCode Configuration with Token
-
-```json
-{
-    "mcp": {
-        "servers": {
-            "my-junos-mcp-server": {
-                "url": "http://127.0.0.1:30030/mcp/",
-                "headers": {
-                    "Authorization": "Bearer jmcp_a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8"
-                }
-            }
-        }
-    }
-}
-```
-
-#### Testing with curl
-
-```bash
-# Test authentication with valid token
-curl -X POST "http://127.0.0.1:30030/mcp/" \
-  -H "Authorization: Bearer jmcp_a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8" \
-  -H "Content-Type: application/json" \
-  -H "Accept: application/json, text/event-stream" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
-
-# Test without token (should fail with 401)
-curl -X POST "http://127.0.0.1:30030/mcp/" \
-  -H "Content-Type: application/json" \
-  -H "Accept: application/json, text/event-stream" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
-```
-
-**Note:** MCP streamable-http requires the `Accept: application/json, text/event-stream` header.
-
-#### Docker with Authentication
-
-When using Docker, mount the `.tokens` file to enable authentication:
-
-```bash
-# Generate token first (outside container)
-python jmcp_token_manager.py generate --id "docker-client"
-
-# Run container with token file mounted
-docker run --rm -it \
-  -v /path/to/devices.json:/app/config/devices.json \
-  -v /path/to/.tokens:/app/.tokens \
-  -p 30030:30030 \
-  junos-mcp-server:latest \
-  python jmcp.py -f /app/config/devices.json -t streamable-http -H 0.0.0.0
-```
-
-### Security Best Practices
-
-1. **Token Security**:
-   - Store tokens securely (password managers, environment variables)
-   - Use descriptive token IDs for easy management
-   - Regularly rotate tokens by revoking old ones and generating new ones
-   - Never commit tokens to version control
-
-2. **Access Control**:
-   - Generate separate tokens for different clients/environments
-   - Revoke tokens immediately when no longer needed
-   - Monitor server logs for unauthorized access attempts
-
-3. **Network Security**:
-   - Run streamable-http server behind reverse proxy with HTTPS in production
-   - Use firewall rules to restrict access to MCP server port
-   - Consider VPN access for remote clients
-
-### Token File Format
-
-The `.tokens` file stores tokens in JSON format:
-
-```json
-{
-  "vscode-dev": {
-    "token": "jmcp_a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8",
-    "description": "VSCode development environment",
-    "created": "2025-01-28T10:30:00Z"
-  },
-  "prod-client": {
-    "token": "jmcp_x9y8z7w6v5u4t3s2r1q0p9o8n7m6l5k4j3i2",
-    "description": "Production client access", 
-    "created": "2025-01-28T09:15:00Z"
   }
 }
 ```
 
-**Important**: Keep this file secure and don't commit it to version control.
+Tip: `get_server_settings` shows the effective default response mode and artifact directory.
 
-## Using MCP Server with Juniper Cloud-Native Router (JCNR)
+### Example: Token-safe "what differs" (diff mode)
 
-JCNR is a cloud native router that runs on various cloud environments. One can use this MCP server with JCNR as well by following the steps given below. Please refer to JCNR documentation for more details on configuration.
+Instead of loading all outputs, ask JMCP to group routers by identical output and show diffs for the variants:
 
-- Configure SSH access in JCNR on a desired port other than 22. This is required because, JCNR runs as a container on shared operating system. Running SSH on default port is not recommended. By default SSH is enabled on port 24. But, it is preferred to change this to desired port depending on your networking needs. 
-- Enable authentication method for SSH. JCNR supports SSH key and password based authentications.
-- Enable Netconf over SSH. This is enabled by default. 
-
-```
-set system services netconf ssh
-set system services ssh port 3030
-set system services ssh root-login allow
-set system root-authentication encrypted-password "$6$3vvMI$RNemhmu9izWXzO46msh38frIg4VoeFNJWJZugxgnU.NQso3OQ00QWOIZmzNePD.MWjDODxBBEYut/W7kfADdV." (or)
-set system root-authentication load-key-file <public key>
-```
-
-## Developer Guide
-
-This section explains the architecture of the Junos MCP server and how to extend it with new tools.
-
-### Architecture Overview
-
-The Junos MCP server uses the Model Context Protocol (MCP) to enable LLMs to interact with Juniper network devices. The server architecture consists of:
-
-1. **MCP Server Core** (`jmcp.py`): Handles MCP protocol communication
-2. **Tool Handlers**: Individual functions that implement specific network operations
-3. **Tool Registry**: Maps tool names to their handler functions
-4. **Transport Layer**: Supports stdio (Claude Desktop) and streamable-http (VSCode)
-
-### How Tools Work
-
-Each tool in the MCP server follows this flow:
-
-```
-LLM Request → MCP Server → Tool Registry → Handler Function → PyEZ → Junos Device
-                                                    ↓
-LLM Response ← MCP Server ← Handler Response ← PyEZ Response ←
-```
-
-### Adding a New Tool
-
-Adding a new tool is a simple 3-step process:
-
-#### Step 1: Create a Handler Function
-
-Create an async handler function in `jmcp.py` (before the `TOOL_HANDLERS` dictionary):
-
-```python
-async def handle_my_new_tool(arguments: dict) -> list[types.ContentBlock]:
-    """Handler for my_new_tool - describe what it does"""
-    # Extract arguments
-    router_name = arguments.get("router_name", "")
-    my_param = arguments.get("my_param", "default_value")
-    
-    # Validate router exists
-    if router_name not in devices:
-        result = f"Router {router_name} not found in the device mapping."
-    else:
-        # Your tool logic here
-        log.debug(f"Executing my_new_tool on router {router_name}")
-        result = _run_junos_cli_command(router_name, f"show {my_param}")
-    
-    return [types.TextContent(type="text", text=result)]
-```
-
-#### Step 2: Register the Handler
-
-Add your handler to the `TOOL_HANDLERS` dictionary (around line 330):
-
-```python
-TOOL_HANDLERS = {
-    "execute_junos_command": handle_execute_junos_command,
-    "get_junos_config": handle_get_junos_config,
-    "junos_config_diff": handle_junos_config_diff,
-    "gather_device_facts": handle_gather_device_facts,
-    "get_router_list": handle_get_router_list,
-    "load_and_commit_config": handle_load_and_commit_config,
-    "add_device": handle_add_device,      # Dynamic device management with elicitation
-    "my_new_tool": handle_my_new_tool,    # Add your tool here
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "tools/call",
+  "id": 4,
+  "params": {
+    "name": "read_artifact",
+    "arguments": {
+      "run_id": "20260127T004712Z-3b791dc1",
+      "mode": "diff",
+      "diff_max_groups": 3,
+      "diff_max_diff_chars": 3000,
+      "diff_max_routers_per_group": 10
+    }
+  }
 }
 ```
 
-#### Step 3: Define Tool Metadata
+Force diffs (even if they’re rewrite-like):
 
-Add the tool definition to the `list_tools()` method (around line 410):
-
-```python
-types.Tool(
-    name="my_new_tool",
-    description="Brief description of what your tool does",
-    inputSchema={
-        "type": "object",
-        "properties": {
-            "router_name": {"type": "string", "description": "The name of the router"},
-            "my_param": {"type": "string", "description": "Description of parameter"}
-        },
-        "required": ["router_name"]  # List required parameters
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "tools/call",
+  "id": 5,
+  "params": {
+    "name": "read_artifact",
+    "arguments": {
+      "run_id": "20260127T004712Z-3b791dc1",
+      "mode": "diff",
+      "diff_include_diffs": true,
+      "diff_max_groups": 1,
+      "diff_max_diff_chars": 1200,
+      "diff_context_lines": 10
     }
-)
-```
-
-### Example: Creating a BGP Neighbors Tool
-
-Here's a complete example of adding a tool to show BGP neighbors:
-
-```python
-# Step 1: Handler function
-async def handle_show_bgp_neighbors(arguments: dict) -> list[types.ContentBlock]:
-    """Handler for show_bgp_neighbors tool"""
-    router_name = arguments.get("router_name", "")
-    neighbor_address = arguments.get("neighbor_address", "")
-    
-    if router_name not in devices:
-        result = f"Router {router_name} not found in the device mapping."
-    else:
-        log.debug(f"Getting BGP neighbors from router {router_name}")
-        if neighbor_address:
-            cmd = f"show bgp neighbor {neighbor_address}"
-        else:
-            cmd = "show bgp summary"
-        result = _run_junos_cli_command(router_name, cmd)
-    
-    return [types.TextContent(type="text", text=result)]
-
-# Step 2: Add to TOOL_HANDLERS
-TOOL_HANDLERS = {
-    # ... existing tools ...
-    "show_bgp_neighbors": handle_show_bgp_neighbors,
+  }
 }
+```
 
-# Step 3: Add to list_tools()
-types.Tool(
-    name="show_bgp_neighbors",
-    description="Show BGP neighbor information",
-    inputSchema={
-        "type": "object",
-        "properties": {
-            "router_name": {"type": "string", "description": "The name of the router"},
-            "neighbor_address": {"type": "string", "description": "Optional: specific neighbor IP"}
-        },
-        "required": ["router_name"]
+Disable diffs entirely (grouping only):
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "tools/call",
+  "id": 6,
+  "params": {
+    "name": "read_artifact",
+    "arguments": {
+      "run_id": "20260127T004712Z-3b791dc1",
+      "mode": "diff",
+      "diff_include_diffs": false
     }
-)
+  }
+}
 ```
 
-### Using Elicitation in Tools
+---
 
-The MCP server supports elicitation for interactive data collection. To use elicitation in your tools:
+## Barrier Sync (Preconnect + Retry) for Batch Tools
 
-```python
-from mcp.server.elicitation import ElicitationResult
-from pydantic import BaseModel, Field
+Applies to:
+- `execute_junos_command_batch` (N routers × 1 command)
+- `execute_junos_commands_batch` (N routers × M commands)
 
-# Define elicitation schema
-class MyInputSchema(BaseModel):
-    user_input: str = Field(description="Enter your input")
+By default, the batch tools start per-router tasks immediately: routers with faster SSH/TCP establishment begin executing while slower routers are still connecting.
 
-async def handle_my_elicitation_tool(arguments: dict, context: Context) -> list[types.ContentBlock]:
-    """Tool that uses elicitation to collect user input"""
-    
-    # Use elicitation to ask for user input
-    result = await context.elicit(
-        message="Please provide the required input:",
-        schema=MyInputSchema
-    )
-    
-    # Handle the result
-    match result:
-        case AcceptedElicitation(data=data):
-            user_input = data.user_input
-            # Process the input...
-            return [types.TextContent(type="text", text=f"Processing: {user_input}")]
-        case DeclinedElicitation() | CancelledElicitation():
-            return [types.TextContent(type="text", text="Operation cancelled")]
+If you want a **"connect barrier"** (connect first, then execute), enable `barrier_sync`.
+
+### What `barrier_sync` Does
+
+- **Phase 1 (preconnect):** concurrently attempts to establish a session to every router (using the connection pool if enabled).
+- **Phase 2 (execute):** runs the command list in parallel **only on routers that preconnected successfully**.
+- Routers that fail preconnect are marked as **skipped** with an error like `preconnect_failed (skipped execution): ...`.
+
+### Retry Behavior
+
+Preconnect supports retries (per router):
+
+- `preconnect_retries` (default `2`) → total attempts = `preconnect_retries + 1`
+- `preconnect_backoff_seconds` (default `1`) between attempts
+- `preconnect_timeout` (default `30`) seconds per attempt
+
+### Barrier Policy
+
+- `barrier_policy: "proceed"` (default): run commands on the connected subset, and report preconnect failures as skipped.
+- `barrier_policy: "strict"`: abort execution if any router fails preconnect.
+
+### Example
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "tools/call",
+  "id": 42,
+  "params": {
+    "name": "execute_junos_commands_batch",
+    "arguments": {
+      "router_names": ["r1", "r2", "r3"],
+      "commands": ["show version brief", "show system uptime"],
+      "timeout": 60,
+      "barrier_sync": true,
+      "barrier_policy": "proceed",
+      "preconnect_timeout": 20,
+      "preconnect_retries": 2,
+      "preconnect_backoff_seconds": 1,
+      "response_mode": "summary"
+    }
+  }
+}
 ```
 
-**Note**: Elicitation currently only works with VSCode (streamable-http transport). Claude Desktop does not support elicitation yet.
+The response includes `preconnect` metadata and counts like `total_routers_executed` and `total_routers_preconnect_failed`.
 
-### Best Practices for Tool Development
+### Example (Single Command)
 
-1. **Error Handling**: Always handle connection errors and invalid inputs gracefully
-2. **Logging**: Use the global `log` logger for debugging
-3. **Validation**: Check if router exists before attempting operations
-4. **Documentation**: Write clear descriptions for tools and parameters
-5. **Timeouts**: Support configurable timeouts for long-running operations
-6. **Return Format**: Always return `list[types.ContentBlock]` with text content
-7. **Elicitation**: Use elicitation for interactive data collection when needed
-8. **Context Parameter**: Include `context: Context` parameter if using elicitation
-
-### Using PyEZ for Advanced Operations
-
-For operations beyond CLI commands, use PyEZ directly:
-
-```python
-from jnpr.junos import Device
-from jnpr.junos.utils.config import Config
-
-# Example: Using PyEZ tables
-async def handle_get_interfaces(arguments: dict) -> list[types.ContentBlock]:
-    router_name = arguments.get("router_name", "")
-    
-    if router_name not in devices:
-        result = f"Router {router_name} not found in the device mapping."
-    else:
-        device_info = devices[router_name]
-        try:
-            connect_params = prepare_connection_params(device_info, router_name)
-            with Device(**connect_params) as junos_device:
-                # Use PyEZ tables or other utilities
-                interfaces = junos_device.rpc.get_interface_information()
-                # Process interfaces...
-                result = "Interface information..."
-        except Exception as e:
-            result = f"Error: {e}"
-    
-    return [types.TextContent(type="text", text=result)]
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "tools/call",
+  "id": 43,
+  "params": {
+    "name": "execute_junos_command_batch",
+    "arguments": {
+      "router_names": ["r1", "r2", "r3"],
+      "command": "show version brief",
+      "timeout": 60,
+      "barrier_sync": true,
+      "barrier_policy": "proceed",
+      "preconnect_timeout": 20,
+      "preconnect_retries": 2,
+      "preconnect_backoff_seconds": 1,
+      "response_mode": "summary"
+    }
+  }
+}
 ```
 
-### Testing Your Tools
+---
 
-1. **Unit Testing**: Test handler functions with mock arguments
-2. **Integration Testing**: Test with actual Junos devices or vSRX
-3. **Error Cases**: Test with invalid routers, network failures, etc.
+## Usage Examples
 
-Example test:
-```python
-# Test the handler directly
-result = await handle_my_new_tool({
-    "router_name": "router-1",
-    "my_param": "test"
-})
-print(result[0].text)
+### Basic Usage
+```bash
+# Start with defaults (heuristic workers, connection pool ON)
+python jmcp.py
+
+# Custom port
+python jmcp.py -p 8080
+
+# Different device file
+python jmcp.py -f my_routers.json
 ```
 
-### Debugging Tips
+### Worker Pool Tuning
+```bash
+# Small deployment (20-30 routers)
+python jmcp.py --workers-per-core 1.5    # total_workers = ceil(cpu_cores * 1.5)
 
-1. Enable debug logging to see detailed execution:
-   ```python
-   logging.basicConfig(level=logging.DEBUG)
-   ```
+# Medium deployment (45-75 routers)
+python jmcp.py --workers-per-core 2.5    # total_workers = ceil(cpu_cores * 2.5)
 
-2. Use the stdio transport for easier debugging:
-   ```bash
-   python jmcp.py -f devices.json -t stdio
-   ```
+# Large deployment (100+ routers)
+python jmcp.py --workers-per-core 4      # total_workers = ceil(cpu_cores * 4)
 
-3. Test individual commands manually:
-   ```python
-   result = _run_junos_cli_command("router-1", "show version")
-   print(result)
-   ```
+# Absolute override
+JMCP_MAX_WORKERS=300 python jmcp.py      # Exactly 300 workers
+```
+
+### Connection Pool Options
+```bash
+# Keep connections alive 10 minutes
+python jmcp.py --idle-timeout 600
+
+# Health check every 60 seconds
+python jmcp.py --health-check-interval 60
+
+# Disable pool (not recommended)
+python jmcp.py --disable-connection-pool
+```
+
+### Production Examples
+```bash
+# Small: 20-30 routers
+python jmcp.py -p 30030 --workers-per-core 1.5
+
+# Medium: 45-75 routers
+python jmcp.py -p 30030 --workers-per-core 2.5 --idle-timeout 600
+
+# Large: 100+ routers
+python jmcp.py -p 30030 --workers-per-core 4 --idle-timeout 900 --health-check-interval 120
+```
+
+---
+
+## File Inventory
+
+### Core Implementation (Updated)
+- **jmcp.py** (75 KB) - Main server with all updates ✓
+- **jmcp_connection_pool.py** (19 KB) - Connection pool implementation ✓
+- **devices.example.json** - Example device inventory template ✓
+- **devices.json** (local/ignored) - Router inventory (do not commit) ✓
+- **utils/** - Configuration utilities ✓
+
+### Testing
+- See [docs/FINAL_TEST_RESULTS.md](docs/FINAL_TEST_RESULTS.md) and [docs/connection_pool/JMCP_CONNECTION_POOL_STRESS_TEST_RESULTS.md](docs/connection_pool/JMCP_CONNECTION_POOL_STRESS_TEST_RESULTS.md)
+
+### Documentation (see separate docs)
+- [docs/QUICK_REFERENCE.md](docs/QUICK_REFERENCE.md) - One-page overview
+- [docs/connection_pool/JMCP_CONNECTION_POOL_SUMMARY.md](docs/connection_pool/JMCP_CONNECTION_POOL_SUMMARY.md) - Executive summary
+- [docs/connection_pool/JMCP_CONNECTION_POOL_IMPLEMENTATION_GUIDE.md](docs/connection_pool/JMCP_CONNECTION_POOL_IMPLEMENTATION_GUIDE.md) - Integration guide
+- [docs/connection_pool/JMCP_CONNECTION_POOL_DESIGN.md](docs/connection_pool/JMCP_CONNECTION_POOL_DESIGN.md) - Architecture
+- [docs/connection_pool/DEVELOPER_HANDOFF_CHECKLIST.md](docs/connection_pool/DEVELOPER_HANDOFF_CHECKLIST.md) - Action items
+
+---
+
+## Key Changes from Original
+
+| Feature | Original | Patched |
+|---------|----------|---------|
+| **Connection Pool** | Manual opt-in | **ENABLED by default** |
+| **Worker Config** | `--max-workers` (absolute) | `--workers-per-core` (scalable; float supported) |
+| **Batch Tools** | Single-router execution focus | **`execute_junos_command_batch` + `execute_junos_commands_batch` (N routers, 1 or M commands)** |
+| **Artifacts (Token Safety)** | None | **`response_mode=artifact` stores full payload + returns `run_id`** |
+| **Artifact Inspection** | N/A | **`list_artifacts` + `read_artifact(mode=failures|diff|full|...)`** |
+| **Barrier Sync** | None | **Preconnect barrier + retry (`barrier_sync`) for near-simultaneous snapshots** |
+| **Output Format** | CLI pipes only / inconsistent | **First-class `format=text|json|xml` knob** |
+| **TCP Sessions** | New session per command (no reuse) | **Persistent 1 session per router (reused across commands)** |
+| **Performance** | Slow (reconnect overhead) | **15-100x faster** |
+| **Help Text** | Basic | **Comprehensive with examples** |
+| **TCP Explanation** | Not documented | **Fully explained in -h** |
+
+---
+
+## Configuration Priority
+
+### Workers
+1. `JMCP_MAX_WORKERS` environment variable (absolute override; integer > 0)
+  - If set, it takes precedence and `--workers-per-core` is ignored.
+2. `--workers-per-core` CLI argument
+3. Default heuristic: `ceil(cpu_cores × 1.5)` workers (floor=8, cap=80)
+
+### Connection Pool
+- **Default:** ENABLED (recommended)
+- **Override:** `--disable-connection-pool` (not recommended)
+
+---
+
+## Support
+
+For detailed implementation guidance, see:
+- [docs/connection_pool/JMCP_CONNECTION_POOL_IMPLEMENTATION_GUIDE.md](docs/connection_pool/JMCP_CONNECTION_POOL_IMPLEMENTATION_GUIDE.md) - Complete integration guide
+- [docs/QUICK_REFERENCE.md](docs/QUICK_REFERENCE.md) - Quick start overview
+
+For performance analysis, see:
+- [docs/connection_pool/JMCP_CONNECTION_POOL_STRESS_TEST_RESULTS.md](docs/connection_pool/JMCP_CONNECTION_POOL_STRESS_TEST_RESULTS.md) - Original validation results
+
+**All systems tested and validated. Ready to deploy.**
+
+
+
+
+list_artifacts knobs (find/select what to read)
+
+artifact_backend: where to list from (disk / redis / dual)
+artifact_dir: (disk) override the directory
+tool: filter by tool name (e.g. only execute_junos_commands_batch)
+label_contains: substring filter on the artifact label
+since: only show artifacts newer than a timestamp
+limit: cap how many results you get back
+
+read_artifact knobs (how much/how shaped you read back)
+
+Select which artifact:
+run_id (recommended) or artifact_path (disk)
+artifact_backend, artifact_dir (where to read from)
+Select which routers (token-safe slicing):
+router_names: explicit subset
+router_offset + router_limit: paginate through routers
+Select representation (mode):
+mode="full" (default), metadata, summary, failures, diff
+Failures view sizing:
+max_output_chars: truncate per-router output snippets in failures
+Diff view controls:
+diff_include_diffs: true/false (or omit and let auto heuristics decide)
+diff_context_lines: unified diff context lines
+diff_max_diff_chars: truncate each diff text
+diff_max_routers_per_group: cap router names listed per hash-group
+diff_max_groups: cap how many variant groups are included (and optionally diffed)
