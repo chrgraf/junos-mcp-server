@@ -90,7 +90,12 @@ def _build_cases(
 ) -> list[Case]:
     supported_tools = {t.get("name") for t in tools if t.get("name")}
 
-    selected = router_names[: max(1, max_routers)]
+    k = max(1, max_routers)
+    if len(router_names) <= k:
+        selected = list(router_names)
+    else:
+        # Random sample for broader stability coverage.
+        selected = random.sample(router_names, k=k)
     # Make some negative cases by adding a clearly invalid router name.
     negative_router = f"__nonexistent_router_{random.randint(1000,9999)}__"
 
@@ -321,6 +326,17 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--port", type=int, default=0, help="Port for temporary server (0=auto)")
     ap.add_argument("--startup-timeout", type=int, default=25)
     ap.add_argument("--timeout", type=int, default=180)
+    ap.add_argument(
+        "--duration-seconds",
+        type=int,
+        default=0,
+        help="If set (>0), keep running cases until this duration elapses (max-cases still caps total).",
+    )
+    ap.add_argument(
+        "--stop-on-failure",
+        action="store_true",
+        help="Abort the run immediately if any case errors.",
+    )
 
     ap.add_argument(
         "--default-artifact-backend",
@@ -381,6 +397,7 @@ def main(argv: list[str]) -> int:
     )
 
     started = time.time()
+    deadline = (started + ns.duration_seconds) if ns.duration_seconds and ns.duration_seconds > 0 else None
     report: dict[str, Any] = {
         "started_utc": _utc_stamp(),
         "base_url": base_url,
@@ -403,25 +420,48 @@ def main(argv: list[str]) -> int:
         report["tools"] = sorted([t.get("name") for t in tools if t.get("name")])
         report["router_count"] = len(routers)
 
-        cases = _build_cases(
-            tools,
-            routers,
-            max_routers=ns.max_routers,
-            max_cases=ns.max_cases,
-            include_barrier=ns.include_barrier,
-            include_artifact_backends=ns.include_artifact_backends,
-        )
-
         ok = 0
         failed = 0
+        total_run = 0
+        batch_index = 0
+        abort_requested = False
 
-        for idx, case in enumerate(cases, start=1):
+        while True:
+            if deadline is not None and time.time() >= deadline:
+                break
+            if total_run >= ns.max_cases:
+                break
+
+            batch_index += 1
+            remaining = ns.max_cases - total_run
+            cases = _build_cases(
+                tools,
+                routers,
+                max_routers=ns.max_routers,
+                max_cases=min(remaining, 50),
+                include_barrier=ns.include_barrier,
+                include_artifact_backends=ns.include_artifact_backends,
+            )
+
+            if not cases:
+                break
+
+            for case in cases:
+                if deadline is not None and time.time() >= deadline:
+                    break
+                if total_run >= ns.max_cases:
+                    break
+                if abort_requested:
+                    break
+
+                idx = total_run + 1
             t0 = time.time()
             row: dict[str, Any] = {
                 "i": idx,
                 "tool": case.tool,
                 "name": case.name,
                 "args": case.args,
+                    "batch": batch_index,
             }
             try:
                 msg = _post_sse(
@@ -453,9 +493,22 @@ def main(argv: list[str]) -> int:
                 row["status"] = "error"
                 row["error"] = str(e)
                 failed += 1
+                if ns.stop_on_failure:
+                    abort_requested = True
             finally:
                 row["duration_s"] = round(time.time() - t0, 3)
                 report["cases"].append(row)
+
+                total_run += 1
+
+            if abort_requested:
+                break
+
+            if deadline is None and total_run >= ns.max_cases:
+                break
+
+            if abort_requested:
+                break
 
         report["summary"] = {
             "ok": ok,

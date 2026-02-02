@@ -37,6 +37,9 @@ python3 tools/regression_matrix_http.py --max-routers 2 --max-cases 25
 
 # More permutations (slower)
 python3 tools/regression_matrix_http.py --max-routers 3 --max-cases 60 --include-barrier --include-artifact-backends
+
+# Long stability run (example: ~1 hour), stop immediately on first failure
+python3 tools/regression_matrix_http.py --duration-seconds 3600 --max-routers 2 --max-cases 500 --include-barrier --include-artifact-backends --stop-on-failure
 ```
 
 This will test progressively:
