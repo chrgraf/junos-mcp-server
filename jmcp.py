@@ -1103,19 +1103,78 @@ def _normalize_cli_output(output: Any) -> str:
 
 
 async def _run_cli_command(router_name: str, command: str, timeout: int = 360, cli_format: str | None = None) -> str:
-    """Run a CLI command with optional connection pooling.
+    """Legacy CLI runner returning only the output string.
 
-    When pooling is enabled (default), reuses a persistent SSH session per router.
-    All blocking PyEZ operations are executed in the thread pool.
+    Newer code should prefer `_run_cli_command_with_meta` to enable automatic
+    transport/timeout healing and to expose retry statistics.
+    """
+    meta = await _run_cli_command_with_meta(
+        router_name,
+        command,
+        timeout,
+        cli_format=cli_format,
+    )
+    return str(meta.get("output") or "")
+
+
+def _default_auto_fallback_to_fresh_for_command(command: str) -> bool:
+    # Default: enable for read-only show commands.
+    cmd = (command or "").lstrip().lower()
+    if not cmd:
+        return False
+    if cmd.startswith("show "):
+        # Allow operator override.
+        if os.getenv("JMCP_AUTO_FALLBACK_TO_FRESH") is not None:
+            return _truthy_env("JMCP_AUTO_FALLBACK_TO_FRESH")
+        return True
+    return False
+
+
+async def _run_cli_command_with_meta(
+    router_name: str,
+    command: str,
+    timeout: int = 360,
+    cli_format: str | None = None,
+    *,
+    connection_mode: str | None = None,
+    auto_fallback_to_fresh: bool | None = None,
+) -> dict[str, Any]:
+    """Run CLI with pooling + optional healing.
+
+    Strategy:
+      - If connection_mode == "fresh": always open/run/close.
+      - Else try pooled first (when available).
+      - If pooled fails with transport/timeout: invalidate + retry once using fresh session
+        (only when auto_fallback_to_fresh is enabled).
     """
     if router_name not in devices:
-        return f"Router {router_name} not found in the device mapping."
+        out = f"Router {router_name} not found in the device mapping."
+        cat, hint = _classify_failure_text(out)
+        return {
+            "output": out,
+            "failure_category": cat,
+            "failure_hint": hint,
+            "connection_mode_used": "none",
+            "attempts": 1,
+            "fresh_fallback_attempted": False,
+            "fresh_fallback_succeeded": False,
+        }
 
     device_info = devices[router_name]
     try:
         connect_params = prepare_connection_params(device_info, router_name)
     except ValueError as ve:
-        return f"Error: {ve}"
+        out = f"Error: {ve}"
+        cat, hint = _classify_failure_text(out)
+        return {
+            "output": out,
+            "failure_category": cat,
+            "failure_hint": hint,
+            "connection_mode_used": "none",
+            "attempts": 1,
+            "fresh_fallback_attempted": False,
+            "fresh_fallback_succeeded": False,
+        }
 
     cli_format_normalized: str | None
     if isinstance(cli_format, str):
@@ -1129,28 +1188,15 @@ async def _run_cli_command(router_name: str, command: str, timeout: int = 360, c
     if cli_format_normalized not in {None, "json", "xml"}:
         cli_format_normalized = None
 
-    pool = connection_pool
-    if pool is not None and pool.enabled:
-        device = await pool.get_connection(router_name)
-        try:
-            def _do_cli() -> str:
-                device.timeout = timeout
-                if cli_format_normalized is None:
-                    return device.cli(command, warning=False)
-                return device.cli(command, warning=False, format=cli_format_normalized)
+    mode = (connection_mode or "pooled").strip().lower() if isinstance(connection_mode, str) else "pooled"
+    if mode not in {"pooled", "fresh"}:
+        mode = "pooled"
 
-            raw = await anyio.to_thread.run_sync(_do_cli, limiter=thread_limiter)
-            return _normalize_cli_output(raw)
-        except ConnectError as ce:
-            await pool.invalidate_connection(router_name)
-            return f"Connection error to {router_name}: {ce}"
-        except Exception as e:
-            await pool.invalidate_connection(router_name)
-            return f"An error occurred: {e}"
-        finally:
-            await pool.release_connection(router_name)
+    if auto_fallback_to_fresh is None:
+        auto_fallback = _default_auto_fallback_to_fresh_for_command(command)
+    else:
+        auto_fallback = bool(auto_fallback_to_fresh)
 
-    # Pool disabled: open/run/close within a single thread for safety
     def _direct_cli() -> Any:
         with Device(**connect_params) as junos_device:
             junos_device.timeout = timeout
@@ -1158,13 +1204,118 @@ async def _run_cli_command(router_name: str, command: str, timeout: int = 360, c
                 return junos_device.cli(command, warning=False)
             return junos_device.cli(command, warning=False, format=cli_format_normalized)
 
-    try:
-        raw = await anyio.to_thread.run_sync(_direct_cli, limiter=thread_limiter)
-        return _normalize_cli_output(raw)
-    except ConnectError as ce:
-        return f"Connection error to {router_name}: {ce}"
-    except Exception as e:
-        return f"An error occurred: {e}"
+    async def _run_fresh() -> dict[str, Any]:
+        try:
+            raw = await anyio.to_thread.run_sync(_direct_cli, limiter=thread_limiter)
+            out = _normalize_cli_output(raw)
+            return {
+                "output": out,
+                "failure_category": "success",
+                "failure_hint": None,
+                "connection_mode_used": "fresh",
+            }
+        except ConnectError as ce:
+            out = f"Connection error to {router_name}: {ce}"
+            cat, hint = _classify_failure_text(out)
+            return {
+                "output": out,
+                "failure_category": cat,
+                "failure_hint": hint,
+                "connection_mode_used": "fresh",
+            }
+        except Exception as e:
+            out = f"An error occurred: {e}"
+            cat, hint = _classify_failure_text(out)
+            return {
+                "output": out,
+                "failure_category": cat if cat != "success" else "other",
+                "failure_hint": hint,
+                "connection_mode_used": "fresh",
+            }
+
+    # Forced fresh mode.
+    if mode == "fresh":
+        res = await _run_fresh()
+        res.update({
+            "attempts": 1,
+            "fresh_fallback_attempted": False,
+            "fresh_fallback_succeeded": False,
+        })
+        return res
+
+    # Pooled first when available.
+    pool = connection_pool
+    if pool is not None and pool.enabled:
+        device = await pool.get_connection(router_name)
+        try:
+            def _do_cli() -> Any:
+                device.timeout = timeout
+                if cli_format_normalized is None:
+                    return device.cli(command, warning=False)
+                return device.cli(command, warning=False, format=cli_format_normalized)
+
+            raw = await anyio.to_thread.run_sync(_do_cli, limiter=thread_limiter)
+            out = _normalize_cli_output(raw)
+            return {
+                "output": out,
+                "failure_category": "success",
+                "failure_hint": None,
+                "connection_mode_used": "pooled",
+                "attempts": 1,
+                "fresh_fallback_attempted": False,
+                "fresh_fallback_succeeded": False,
+            }
+        except ConnectError as ce:
+            out = f"Connection error to {router_name}: {ce}"
+            cat, hint = _classify_failure_text(out)
+            with suppress(Exception):
+                await pool.invalidate_connection(router_name)
+            pooled_cat = cat if cat != "success" else "transport"
+            pooled_hint = hint or out[:160]
+        except Exception as e:
+            # Try to map generic exceptions into buckets.
+            msg = str(e)
+            cat, hint = _classify_failure_text(msg)
+            out = f"An error occurred: {e}"
+            with suppress(Exception):
+                await pool.invalidate_connection(router_name)
+            pooled_cat = cat if cat != "success" else "other"
+            pooled_hint = hint or msg[:160] if msg else None
+        finally:
+            with suppress(Exception):
+                await pool.release_connection(router_name)
+
+        # Optional healing: on transport/timeout, retry once using fresh session.
+        if auto_fallback and pooled_cat in {"transport", "timeout"}:
+            fresh = await _run_fresh()
+            ok = fresh.get("failure_category") == "success"
+            fresh.update({
+                "attempts": 2,
+                "fresh_fallback_attempted": True,
+                "fresh_fallback_succeeded": bool(ok),
+                "pooled_failure_category": pooled_cat,
+                "pooled_failure_hint": pooled_hint,
+            })
+            return fresh
+
+        return {
+            "output": out,
+            "failure_category": pooled_cat,
+            "failure_hint": pooled_hint,
+            "connection_mode_used": "pooled",
+            "attempts": 1,
+            "fresh_fallback_attempted": False,
+            "fresh_fallback_succeeded": False,
+        }
+
+    # Pool disabled: behave like fresh.
+    res = await _run_fresh()
+    res.update({
+        "attempts": 1,
+        "fresh_fallback_attempted": False,
+        "fresh_fallback_succeeded": False,
+    })
+    return res
 
 
 def _looks_like_cli_error(output: Any) -> bool:
@@ -1189,6 +1340,136 @@ def _looks_like_cli_error(output: Any) -> bool:
         return True
 
     return False
+
+
+FailureCategory = Literal[
+    "success",
+    "preconnect_failed",
+    "auth",
+    "transport",
+    "timeout",
+    "cli",
+    "other",
+]
+
+
+def _classify_failure_text(text: str) -> tuple[FailureCategory, str | None]:
+    """Best-effort classification of failures from text.
+
+    This is intentionally heuristic because many error paths are already
+    string-based (e.g. _run_cli_command returns human-readable messages).
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return "success", None
+
+    low = raw.lower()
+
+    # Barrier skip marker (produced by barrier_sync proceed-mode).
+    if "preconnect_failed (skipped execution)" in low or low.startswith("preconnect_failed"):
+        return "preconnect_failed", raw.splitlines()[0][:160]
+
+    auth_keywords = (
+        "authentication failed",
+        "auth fail",
+        "permission denied",
+        "publickey",
+        "login incorrect",
+        "invalid password",
+        "not authorized",
+        "access denied",
+        "too many authentication failures",
+    )
+    timeout_keywords = (
+        "timed out",
+        "timeout",
+        "operation timed out",
+    )
+    transport_keywords = (
+        "connection reset",
+        "connection refused",
+        "broken pipe",
+        "no route to host",
+        "network is unreachable",
+        "connection aborted",
+        "connection closed",
+        "eof",
+        "socket is closed",
+        "connection unexpectedly closed",
+    )
+    cli_keywords = (
+        "unknown command",
+        "syntax error",
+        "invalid",
+        "ambiguous",
+        "not a valid command",
+        "permission denied",
+    )
+
+    # Auth before CLI because many platforms use "permission denied" for authz.
+    if any(k in low for k in auth_keywords):
+        return "auth", raw.splitlines()[0][:160]
+
+    if any(k in low for k in timeout_keywords):
+        return "timeout", raw.splitlines()[0][:160]
+
+    if any(k in low for k in transport_keywords):
+        return "transport", raw.splitlines()[0][:160]
+
+    # CLI errors are often returned as text even when transport is healthy.
+    if any(k in low for k in cli_keywords):
+        return "cli", raw.splitlines()[0][:160]
+
+    # Known prefixes from _run_cli_command.
+    if low.startswith("connection error"):
+        return "transport", raw.splitlines()[0][:160]
+    if low.startswith("an error occurred") or low.startswith("error:"):
+        return "other", raw.splitlines()[0][:160]
+    if "not found in the device mapping" in low:
+        return "other", raw.splitlines()[0][:160]
+
+    return "success", None
+
+
+def _rollup_router_failure_category(router_obj: dict[str, Any]) -> tuple[FailureCategory, str | None]:
+    """Derive a per-router failure category from a multi-command router object."""
+    # Router-level error (e.g. preconnect skip or gather exception)
+    err = router_obj.get("error")
+    if isinstance(err, str) and err.strip():
+        return _classify_failure_text(err)
+
+    # Command-level failures
+    results = router_obj.get("results")
+    if not isinstance(results, list):
+        return "success", None
+
+    categories: list[FailureCategory] = []
+    hints: list[str] = []
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        cat = item.get("failure_category")
+        hint = item.get("failure_hint")
+        if isinstance(cat, str):
+            categories.append(cat)  # type: ignore[arg-type]
+        if isinstance(hint, str) and hint.strip():
+            hints.append(hint.strip())
+
+    if not categories:
+        return "success", None
+
+    # Priority: auth > transport > timeout > cli > other > preconnect_failed > success
+    priority: dict[FailureCategory, int] = {
+        "auth": 60,
+        "transport": 50,
+        "timeout": 40,
+        "cli": 30,
+        "other": 20,
+        "preconnect_failed": 10,
+        "success": 0,
+    }
+    worst = max(categories, key=lambda c: priority.get(c, 0))
+    return worst, (hints[0][:160] if hints else None)
 
 
 class Context(BaseModel, Generic[ServerSessionT, LifespanContextT, RequestT]):
@@ -1840,6 +2121,16 @@ async def handle_execute_junos_command_batch(arguments: dict, context: Context) 
     cli_format = arguments.get("format")
     timeout = get_timeout_with_fallback(arguments.get("timeout"))
 
+    connection_mode = arguments.get("connection_mode")
+    if isinstance(connection_mode, str):
+        connection_mode = connection_mode.strip().lower()
+    if connection_mode not in {"pooled", "fresh"}:
+        connection_mode = "pooled"
+
+    auto_fallback_to_fresh = arguments.get("auto_fallback_to_fresh")
+    if auto_fallback_to_fresh is not None:
+        auto_fallback_to_fresh = bool(auto_fallback_to_fresh)
+
     barrier_sync = bool(arguments.get("barrier_sync"))
     barrier_policy = arguments.get("barrier_policy") or "proceed"
     if isinstance(barrier_policy, str):
@@ -1915,7 +2206,7 @@ async def handle_execute_junos_command_batch(arguments: dict, context: Context) 
             for attempt in range(preconnect_retries + 1):
                 device = None
                 try:
-                    if pool is not None and pool.enabled:
+                    if connection_mode != "fresh" and pool is not None and pool.enabled:
                         with anyio.fail_after(preconnect_timeout):
                             device = await pool.get_connection(router_name)
                     else:
@@ -1999,6 +2290,18 @@ async def handle_execute_junos_command_batch(arguments: dict, context: Context) 
             batch_end_time = time.time()
             batch_duration = round(batch_end_time - batch_start_time, 3)
 
+            # In strict mode we execute nothing; some routers failed preconnect,
+            # and the rest are blocked by policy.
+            strict_not_executed = len(router_names) - len(preconnect_failed_map)
+            strict_breakdown: dict[str, int] = {
+                "preconnect_failed": len(preconnect_failed_map),
+                "auth": 0,
+                "transport": 0,
+                "timeout": 0,
+                "cli": 0,
+                "other": strict_not_executed,
+            }
+
             response_data: dict[str, Any] = {
                 "error": "preconnect_failed",
                 "message": "Barrier preconnect failed for one or more routers; strict policy prevents execution.",
@@ -2010,6 +2313,19 @@ async def handle_execute_junos_command_batch(arguments: dict, context: Context) 
                     "total_routers_preconnect_failed": len(preconnect_failed_map),
                     "successful": 0,
                     "failed": len(router_names),
+                    "not_executed_due_to_strict_policy": strict_not_executed,
+                    "failure_breakdown": strict_breakdown,
+                    "connection": {
+                        "connection_mode": connection_mode,
+                        "auto_fallback_to_fresh": auto_fallback_to_fresh,
+                    },
+                    "retry_stats": {
+                        "routers_used_pooled": 0,
+                        "routers_used_fresh": 0,
+                        "routers_with_fresh_fallback_attempted": 0,
+                        "routers_with_fresh_fallback_succeeded": 0,
+                        "routers_with_fresh_fallback_failed": 0,
+                    },
                     "total_duration": batch_duration,
                 },
             }
@@ -2024,6 +2340,8 @@ async def handle_execute_junos_command_batch(arguments: dict, context: Context) 
                                 "router_names": router_names,
                                 "command": command,
                                 "timeout": timeout,
+                                "connection_mode": connection_mode,
+                                "auto_fallback_to_fresh": auto_fallback_to_fresh,
                                 "barrier_sync": True,
                                 "barrier_policy": barrier_policy,
                                 "preconnect_timeout": preconnect_timeout,
@@ -2065,6 +2383,9 @@ async def handle_execute_junos_command_batch(arguments: dict, context: Context) 
         """
         start_time = time.time()
         start_timestamp = datetime.now(timezone.utc).isoformat()
+        meta: dict[str, Any] | None = None
+        failure_category: str | None = None
+        failure_hint: str | None = None
 
         try:
             # ----------------------------------------------------------------
@@ -2088,24 +2409,34 @@ async def handle_execute_junos_command_batch(arguments: dict, context: Context) 
             # Think of it like: Each router gets its own phone line (thread),
             # and all phone calls happen at the same time instead of one after another.
 
-            result = await _run_cli_command(router_name, command, timeout, cli_format=cli_format)
+            meta = await _run_cli_command_with_meta(
+                router_name,
+                command,
+                timeout,
+                cli_format=cli_format,
+                connection_mode=connection_mode,
+                auto_fallback_to_fresh=auto_fallback_to_fresh,
+            )
 
-            # Determine if this was a success or error based on result content
-            # (the _run_junos_cli_command returns error messages as strings)
-            is_error = result.startswith("Connection error") or result.startswith("An error occurred") or result.startswith("Error:")
-            status = "failed" if is_error else "success"
+            result = str(meta.get("output") or "")
+            failure_category = meta.get("failure_category")
+            failure_hint = meta.get("failure_hint")
+            status = "success" if failure_category == "success" else "failed"
 
         except Exception as e:
             # Catch any unexpected exceptions (shouldn't happen normally)
             result = f"Exception during execution: {str(e)}"
             status = "failed"
+            failure_category, failure_hint = _classify_failure_text(result)
+            if failure_category == "success":
+                failure_category = "other"
 
         end_time = time.time()
         end_timestamp = datetime.now(timezone.utc).isoformat()
         execution_duration = round(end_time - start_time, 3)
 
         # Return structured data for this single router
-        return {
+        payload: dict[str, Any] = {
             "router_name": router_name,
             "status": status,
             "output": result,
@@ -2114,6 +2445,26 @@ async def handle_execute_junos_command_batch(arguments: dict, context: Context) 
             "start_time": start_timestamp,
             "end_time": end_timestamp
         }
+
+        if isinstance(meta, dict):
+            payload.update({
+                "connection_mode_used": meta.get("connection_mode_used"),
+                "attempts": meta.get("attempts"),
+                "fresh_fallback_attempted": meta.get("fresh_fallback_attempted"),
+                "fresh_fallback_succeeded": meta.get("fresh_fallback_succeeded"),
+            })
+            if meta.get("fresh_fallback_attempted"):
+                if meta.get("pooled_failure_category"):
+                    payload["pooled_failure_category"] = meta.get("pooled_failure_category")
+                if meta.get("pooled_failure_hint"):
+                    payload["pooled_failure_hint"] = meta.get("pooled_failure_hint")
+
+        if status != "success":
+            payload["failure_category"] = failure_category or "other"
+            if failure_hint:
+                payload["failure_hint"] = failure_hint
+
+        return payload
 
     # ============================================================================
     # STEP 3: Launch All Tasks in Parallel with asyncio.gather()
@@ -2165,6 +2516,8 @@ async def handle_execute_junos_command_batch(arguments: dict, context: Context) 
                 "router_name": skipped_router,
                 "status": "failed",
                 "output": f"preconnect_failed (skipped execution): {err}",
+                "failure_category": "preconnect_failed",
+                "failure_hint": str(err)[:160] if err else "preconnect_failed",
                 "execution_duration": 0,
                 "start_time": now_ts,
                 "end_time": now_ts,
@@ -2198,6 +2551,41 @@ async def handle_execute_junos_command_batch(arguments: dict, context: Context) 
         },
     }
 
+    response_data["summary"]["connection"] = {
+        "connection_mode": connection_mode,
+        "auto_fallback_to_fresh": auto_fallback_to_fresh,
+    }
+
+    # Failure breakdown by router (token-safe, operator-friendly)
+    breakdown: dict[str, int] = {"preconnect_failed": 0, "auth": 0, "transport": 0, "timeout": 0, "cli": 0, "other": 0}
+    for r in results:
+        if r.get("status") == "success":
+            continue
+        cat = r.get("failure_category")
+        if not isinstance(cat, str) or not cat:
+            out = r.get("output")
+            cat, _ = _classify_failure_text(out if isinstance(out, str) else "")
+        if cat == "success":
+            cat = "other"
+        if cat not in breakdown:
+            cat = "other"
+        breakdown[cat] += 1
+
+    response_data["summary"]["failure_breakdown"] = breakdown
+
+    # Retry/healing statistics (router-level)
+    used_pooled = sum(1 for r in results if r.get("connection_mode_used") == "pooled")
+    used_fresh = sum(1 for r in results if r.get("connection_mode_used") == "fresh")
+    fallback_attempted = sum(1 for r in results if r.get("fresh_fallback_attempted") is True)
+    fallback_succeeded = sum(1 for r in results if r.get("fresh_fallback_succeeded") is True)
+    response_data["summary"]["retry_stats"] = {
+        "routers_used_pooled": used_pooled,
+        "routers_used_fresh": used_fresh,
+        "routers_with_fresh_fallback_attempted": fallback_attempted,
+        "routers_with_fresh_fallback_succeeded": fallback_succeeded,
+        "routers_with_fresh_fallback_failed": max(0, fallback_attempted - fallback_succeeded),
+    }
+
     if response_mode in {"summary", "artifact"}:
         # Keep payload small: include only minimal per-router metadata.
         router_summaries = [
@@ -2205,6 +2593,12 @@ async def handle_execute_junos_command_batch(arguments: dict, context: Context) 
                 "router_name": r.get("router_name"),
                 "status": r.get("status"),
                 "execution_duration": r.get("execution_duration"),
+                "failure_category": r.get("failure_category"),
+                "failure_hint": r.get("failure_hint"),
+                "connection_mode_used": r.get("connection_mode_used"),
+                "attempts": r.get("attempts"),
+                "fresh_fallback_attempted": r.get("fresh_fallback_attempted"),
+                "fresh_fallback_succeeded": r.get("fresh_fallback_succeeded"),
             }
             for r in results
         ]
@@ -2225,6 +2619,8 @@ async def handle_execute_junos_command_batch(arguments: dict, context: Context) 
                         "router_names": router_names,
                         "command": command,
                         "timeout": timeout,
+                        "connection_mode": connection_mode,
+                        "auto_fallback_to_fresh": auto_fallback_to_fresh,
                         "barrier_sync": barrier_sync,
                         "barrier_policy": barrier_policy,
                         "preconnect_timeout": preconnect_timeout,
@@ -2573,6 +2969,16 @@ async def handle_execute_junos_commands_batch(arguments: dict, context: Context)
     cli_format = arguments.get("format")
     timeout = get_timeout_with_fallback(arguments.get("timeout"))
 
+    connection_mode = arguments.get("connection_mode")
+    if isinstance(connection_mode, str):
+        connection_mode = connection_mode.strip().lower()
+    if connection_mode not in {"pooled", "fresh"}:
+        connection_mode = "pooled"
+
+    auto_fallback_to_fresh = arguments.get("auto_fallback_to_fresh")
+    if auto_fallback_to_fresh is not None:
+        auto_fallback_to_fresh = bool(auto_fallback_to_fresh)
+
     barrier_sync = bool(arguments.get("barrier_sync"))
     barrier_policy = arguments.get("barrier_policy") or "proceed"
     if isinstance(barrier_policy, str):
@@ -2655,7 +3061,7 @@ async def handle_execute_junos_commands_batch(arguments: dict, context: Context)
             for attempt in range(preconnect_retries + 1):
                 device = None
                 try:
-                    if pool is not None and pool.enabled:
+                    if connection_mode != "fresh" and pool is not None and pool.enabled:
                         with anyio.fail_after(preconnect_timeout):
                             device = await pool.get_connection(router_name)
                     else:
@@ -2739,6 +3145,16 @@ async def handle_execute_junos_commands_batch(arguments: dict, context: Context)
             end_timestamp = datetime.now(timezone.utc).isoformat()
             total_duration = round(end_time - start_time, 3)
 
+            strict_not_executed = len(router_names) - len(preconnect_failed_map)
+            strict_breakdown: dict[str, int] = {
+                "preconnect_failed": len(preconnect_failed_map),
+                "auth": 0,
+                "transport": 0,
+                "timeout": 0,
+                "cli": 0,
+                "other": strict_not_executed,
+            }
+
             response_mode = _resolve_effective_response_mode(arguments)
             response: dict[str, Any] = {
                 "error": "preconnect_failed",
@@ -2748,10 +3164,25 @@ async def handle_execute_junos_commands_batch(arguments: dict, context: Context)
                 "total_commands_executed": 0,
                 "total_successful": 0,
                 "total_failed": len(router_names) * len(commands),
+                "not_executed_due_to_strict_policy": strict_not_executed,
+                "failure_breakdown": strict_breakdown,
                 "total_duration": total_duration,
                 "start_time": start_timestamp,
                 "end_time": end_timestamp,
                 "preconnect": preconnect_info,
+            }
+
+            response["connection"] = {
+                "connection_mode": connection_mode,
+                "auto_fallback_to_fresh": auto_fallback_to_fresh,
+            }
+
+            response["retry_stats"] = {
+                "commands_used_pooled": 0,
+                "commands_used_fresh": 0,
+                "commands_with_fresh_fallback_attempted": 0,
+                "commands_with_fresh_fallback_succeeded": 0,
+                "commands_with_fresh_fallback_failed": 0,
             }
 
             if _should_persist_to_disk(arguments, response_mode):
@@ -2764,6 +3195,8 @@ async def handle_execute_junos_commands_batch(arguments: dict, context: Context)
                                 "router_names": router_names,
                                 "commands": commands,
                                 "timeout": timeout,
+                                "connection_mode": connection_mode,
+                                "auto_fallback_to_fresh": auto_fallback_to_fresh,
                                 "barrier_sync": True,
                                 "barrier_policy": barrier_policy,
                                 "preconnect_timeout": preconnect_timeout,
@@ -2777,6 +3210,10 @@ async def handle_execute_junos_commands_batch(arguments: dict, context: Context)
                                 "total_commands_executed": 0,
                                 "total_successful": 0,
                                 "total_failed": len(router_names) * len(commands),
+                                "not_executed_due_to_strict_policy": strict_not_executed,
+                                "failure_breakdown": strict_breakdown,
+                                "connection": response.get("connection"),
+                                "retry_stats": response.get("retry_stats"),
                                 "total_duration": total_duration,
                                 "start_time": start_timestamp,
                                 "end_time": end_timestamp,
@@ -2809,9 +3246,19 @@ async def handle_execute_junos_commands_batch(arguments: dict, context: Context)
             
             try:
                 log.debug(f"[{router_name}][{idx}/{len(commands)}] Executing: {command}")
-                
-                result = await _run_cli_command(router_name, command, timeout, cli_format=cli_format)
-                is_error = _looks_like_cli_error(result)
+
+                meta = await _run_cli_command_with_meta(
+                    router_name,
+                    command,
+                    timeout,
+                    cli_format=cli_format,
+                    connection_mode=connection_mode,
+                    auto_fallback_to_fresh=auto_fallback_to_fresh,
+                )
+                result = str(meta.get("output") or "")
+                failure_category = meta.get("failure_category")
+                failure_hint = meta.get("failure_hint")
+                is_error = failure_category != "success"
                 
                 cmd_end = time.time()
                 cmd_duration = round(cmd_end - cmd_start, 3)
@@ -2824,9 +3271,21 @@ async def handle_execute_junos_commands_batch(arguments: dict, context: Context)
                     "execution_duration": cmd_duration,
                     "start_time": cmd_start_ts,
                     "end_time": datetime.now(timezone.utc).isoformat(),
+                    "connection_mode_used": meta.get("connection_mode_used"),
+                    "attempts": meta.get("attempts"),
+                    "fresh_fallback_attempted": meta.get("fresh_fallback_attempted"),
+                    "fresh_fallback_succeeded": meta.get("fresh_fallback_succeeded"),
                 }
                 if is_error:
                     cmd_result["error"] = result
+                    cmd_result["failure_category"] = failure_category
+                    if failure_hint:
+                        cmd_result["failure_hint"] = failure_hint
+                elif meta.get("fresh_fallback_attempted"):
+                    if meta.get("pooled_failure_category"):
+                        cmd_result["pooled_failure_category"] = meta.get("pooled_failure_category")
+                    if meta.get("pooled_failure_hint"):
+                        cmd_result["pooled_failure_hint"] = meta.get("pooled_failure_hint")
                 router_results.append(cmd_result)
                 
                 log.debug(f"[{router_name}][{idx}/{len(commands)}] Completed in {cmd_duration}s")
@@ -2835,11 +3294,17 @@ async def handle_execute_junos_commands_batch(arguments: dict, context: Context)
                 cmd_end = time.time()
                 cmd_duration = round(cmd_end - cmd_start, 3)
                 error_msg = str(e)
+
+                failure_category, failure_hint = _classify_failure_text(error_msg)
+                if failure_category == "success":
+                    failure_category = "other"
                 
                 router_results.append({
                     "command": command,
                     "success": False,
                     "error": error_msg,
+                    "failure_category": failure_category,
+                    "failure_hint": (failure_hint or error_msg)[:160] if error_msg else failure_hint,
                     "execution_duration": cmd_duration,
                     "start_time": cmd_start_ts,
                     "end_time": datetime.now(timezone.utc).isoformat()
@@ -2900,6 +3365,8 @@ async def handle_execute_junos_commands_batch(arguments: dict, context: Context)
                 "failed": len(commands),
                 "router_duration": 0,
                 "error": f"preconnect_failed (skipped execution): {err}",
+                "failure_category": "preconnect_failed",
+                "failure_hint": str(err)[:160] if err else "preconnect_failed",
                 "results": [],
             })
     
@@ -2928,12 +3395,99 @@ async def handle_execute_junos_commands_batch(arguments: dict, context: Context)
         "end_time": end_timestamp,
     }
 
+    response["connection"] = {
+        "connection_mode": connection_mode,
+        "auto_fallback_to_fresh": auto_fallback_to_fresh,
+    }
+
+    # Failure breakdown by router (not by command) for operator-friendly reporting.
+    breakdown: dict[str, int] = {"preconnect_failed": 0, "auth": 0, "transport": 0, "timeout": 0, "cli": 0, "other": 0}
+    for r in processed_responses:
+        cat = r.get("failure_category")
+        hint = r.get("failure_hint")
+        if not isinstance(cat, str) or not cat:
+            cat, hint = _rollup_router_failure_category(r)
+        if cat == "success":
+            continue
+        if cat not in breakdown:
+            cat = "other"
+        breakdown[cat] += 1
+
+    response["failure_breakdown"] = breakdown
+
+    # Optional: failure breakdown by command (all failed commands across all routers).
+    cmd_breakdown: dict[str, int] = {"preconnect_failed": 0, "auth": 0, "transport": 0, "timeout": 0, "cli": 0, "other": 0}
+    for r in processed_responses:
+        # Router-level skips count as failures for every command.
+        r_cat = r.get("failure_category")
+        if isinstance(r_cat, str) and r_cat == "preconnect_failed":
+            cmd_breakdown["preconnect_failed"] += len(commands)
+            continue
+
+        results = r.get("results")
+        if not isinstance(results, list):
+            continue
+        for item in results:
+            if not isinstance(item, dict):
+                continue
+            if item.get("success") is True:
+                continue
+            cat = item.get("failure_category")
+            if not isinstance(cat, str) or not cat:
+                err = item.get("error")
+                cat, _ = _classify_failure_text(err if isinstance(err, str) else "")
+            if cat == "success":
+                cat = "other"
+            if cat not in cmd_breakdown:
+                cat = "other"
+            cmd_breakdown[cat] += 1
+
+    response["failure_breakdown_commands"] = cmd_breakdown
+
+    # Retry/healing statistics (command-level)
+    cmds_used_pooled = 0
+    cmds_used_fresh = 0
+    cmds_fallback_attempted = 0
+    cmds_fallback_succeeded = 0
+
+    for r in processed_responses:
+        # Router-level skips: no commands were executed.
+        if r.get("failure_category") == "preconnect_failed":
+            continue
+        items = r.get("results")
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            mode_used = item.get("connection_mode_used")
+            if mode_used == "pooled":
+                cmds_used_pooled += 1
+            elif mode_used == "fresh":
+                cmds_used_fresh += 1
+            if item.get("fresh_fallback_attempted") is True:
+                cmds_fallback_attempted += 1
+            if item.get("fresh_fallback_succeeded") is True:
+                cmds_fallback_succeeded += 1
+
+    response["retry_stats"] = {
+        "commands_used_pooled": cmds_used_pooled,
+        "commands_used_fresh": cmds_used_fresh,
+        "commands_with_fresh_fallback_attempted": cmds_fallback_attempted,
+        "commands_with_fresh_fallback_succeeded": cmds_fallback_succeeded,
+        "commands_with_fresh_fallback_failed": max(0, cmds_fallback_attempted - cmds_fallback_succeeded),
+    }
+
     if barrier_sync and preconnect_info is not None:
         response["preconnect"] = preconnect_info
 
     if response_mode in {"summary", "artifact"}:
         router_summaries = []
         for r in processed_responses:
+            cat = r.get("failure_category")
+            hint = r.get("failure_hint")
+            if not isinstance(cat, str) or not cat:
+                cat, hint = _rollup_router_failure_category(r)
             router_summaries.append({
                 "router_name": r.get("router_name"),
                 "executed_commands": r.get("executed_commands"),
@@ -2941,6 +3495,8 @@ async def handle_execute_junos_commands_batch(arguments: dict, context: Context)
                 "failed": r.get("failed"),
                 "router_duration": r.get("router_duration"),
                 "error": r.get("error"),
+                "failure_category": cat,
+                "failure_hint": hint,
             })
 
         failed_routers = [r for r in router_summaries if (r.get("failed") or 0) > 0 or r.get("error")]
@@ -2966,6 +3522,8 @@ async def handle_execute_junos_commands_batch(arguments: dict, context: Context)
                         "router_names": router_names,
                         "commands": commands,
                         "timeout": timeout,
+                        "connection_mode": connection_mode,
+                        "auto_fallback_to_fresh": auto_fallback_to_fresh,
                         "barrier_sync": barrier_sync,
                         "barrier_policy": barrier_policy,
                         "preconnect_timeout": preconnect_timeout,
@@ -2981,6 +3539,9 @@ async def handle_execute_junos_commands_batch(arguments: dict, context: Context)
                         "total_commands_executed": total_commands_executed,
                         "total_successful": total_successful,
                         "total_failed": total_failed,
+                        "failure_breakdown": response.get("failure_breakdown"),
+                        "connection": response.get("connection"),
+                        "retry_stats": response.get("retry_stats"),
                         "total_duration": total_duration,
                         "start_time": start_timestamp,
                         "end_time": end_timestamp,
@@ -3538,6 +4099,16 @@ def create_mcp_server() -> Server:
                             "enum": ["text", "json", "xml"]
                         },
                         "timeout": {"type": "integer", "description": "Command timeout in seconds per router", "default": 360},
+                        "connection_mode": {
+                            "type": "string",
+                            "description": "Connection strategy per router: pooled (default) uses the connection pool when enabled; fresh always opens a new session per router",
+                            "enum": ["pooled", "fresh"],
+                            "default": "pooled"
+                        },
+                        "auto_fallback_to_fresh": {
+                            "type": "boolean",
+                            "description": "When connection_mode=pooled: if a pooled attempt fails with transport/timeout, invalidate and retry once using a fresh session. If omitted, the server chooses a safe default (typically enabled for 'show' commands)."
+                        },
                         "barrier_sync": {
                             "type": "boolean",
                             "description": "If true: preconnect to routers first, then (optionally) run the command only on routers with established sessions",
@@ -3566,13 +4137,23 @@ def create_mcp_server() -> Server:
                         },
                         "response_mode": {
                             "type": "string",
-                            "description": "Response size mode: full (include all outputs), summary (only failures/metadata), artifact (persist full results to disk and return only summary+pointer)",
+                            "description": "Response size mode: full (include all outputs), summary (only failures/metadata), artifact (persist full results to configured artifact backend and return only summary+pointer)",
                             "enum": ["full", "summary", "artifact"]
                         },
                         "persist_to_disk": {
                             "type": "boolean",
-                            "description": "If true, persist full results to disk and include an artifact pointer in the response",
+                            "description": "If true, persist full results to the configured artifact backend and include an artifact pointer in the response",
                             "default": False
+                        },
+                        "persist_to_redis": {
+                            "type": "boolean",
+                            "description": "If true, persist full results to the configured artifact backend (use with artifact_backend=redis/dual); kept for convenience",
+                            "default": False
+                        },
+                        "artifact_backend": {
+                            "type": "string",
+                            "description": "Artifact storage backend: disk (files), redis (Redis), dual (both; Redis primary)",
+                            "enum": ["disk", "redis", "dual"]
                         },
                         "artifact_label": {"type": "string", "description": "Optional short label added to the artifact filename"},
                         "artifact_dir": {"type": "string", "description": "Optional directory to store artifacts (defaults to JMCP_ARTIFACT_DIR or <jmcp.py dir>/artifacts)"}
@@ -3602,6 +4183,16 @@ def create_mcp_server() -> Server:
                             "enum": ["text", "json", "xml"]
                         },
                         "timeout": {"type": "integer", "description": "Command timeout in seconds per command", "default": 360},
+                        "connection_mode": {
+                            "type": "string",
+                            "description": "Connection strategy per router: pooled (default) uses the connection pool when enabled; fresh always opens a new session per router",
+                            "enum": ["pooled", "fresh"],
+                            "default": "pooled"
+                        },
+                        "auto_fallback_to_fresh": {
+                            "type": "boolean",
+                            "description": "When connection_mode=pooled: if a pooled attempt fails with transport/timeout, invalidate and retry once using a fresh session. If omitted, the server chooses a safe default (typically enabled for 'show' commands)."
+                        },
                         "barrier_sync": {
                             "type": "boolean",
                             "description": "If true: preconnect to routers first, then (optionally) run commands only on routers with established sessions",

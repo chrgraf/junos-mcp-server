@@ -15,9 +15,13 @@ With very large datasets, there is a risk of exhausting the LLM context window. 
 External Python remains best for maximum performance and token efficiency, but enhanced JMCP can reduce the need for extra scripts in some operational scenarios, lowering complexity and improving robustness.
 
 **binaries delta to junos-mcp-server**
-If you already using the junos-mcp-server, then the only item you need from this repo:
+If you are already using the upstream `junos-mcp-server`, then the only files you typically need from this repo are:
 - jmcp_connection_pool.py
-- jmcp.py 
+- jmcp.py
+- artifact_store.py (required if you use `response_mode=artifact` / artifact tools)
+
+Optional helper:
+- merge_devices_json.py (only needed if you want to merge multiple device inventories)
 
 ## overall advantages
 The advantages of this enhanced JMCP are:
@@ -272,7 +276,9 @@ Once configured, you can use the same batching prompts as above; JMCP will retur
 
 ### Full mcp.json example (stdio)
 
-Paste a complete server entry. In VS Code, the top-level key is typically `mcpServers`.
+Paste a complete server entry.
+
+Note: depending on your VS Code version/extension, the top-level key may be `servers` (newer) or `mcpServers` (older). Keep whatever your existing `mcp.json` uses.
 
 ```json
 {
@@ -322,6 +328,10 @@ Note: if you set `JMCP_ARTIFACT_BACKEND=redis|dual`, the Python environment used
 - **TCP sessions:** 1 per router (reused across all commands)
 - **Override:** Use `--disable-connection-pool` to disable (not recommended)
 
+Per-request override (batch tools):
+- `connection_mode="pooled"|"fresh"` lets you bypass pooling for a single call without changing global server flags.
+- `auto_fallback_to_fresh=true` (when `connection_mode="pooled"`) retries once with a fresh session if the pooled session hits a likely-stale transport/timeout error.
+
 ### **Workers-Per-Core Model** ✓
 - **Replaced:** `--max-workers` → `--workers-per-core`
 - **Default (if omitted):** `ceil(cpu_cores × 1.5)` workers (floor=8, cap=80)
@@ -348,6 +358,58 @@ Options:
 - Copy the template: `cp devices.example.json devices.json`
 - Edit `devices.json` with your real routers and credentials
 - `devices.json` is intentionally ignored by git
+
+---
+
+## Regression testing (recommended)
+
+This repo uses lightweight Python scripts in `tools/` (not `pytest`) to validate common flows.
+
+### 1) Local/unit-style checks (no server required)
+
+If you have `uv` installed, `make test` works out of the box. The Makefile uses `uv run ...`.
+
+Without `uv`, run the scripts directly:
+
+```bash
+cd /path/to/junos-mcp-server-cg
+PYTHONPATH=$PWD /path/to/python tools/test_config_validation.py
+PYTHONPATH=$PWD /path/to/python tools/test_get_router_list.py
+```
+
+### 2) Integration smoke test (HTTP SSE)
+
+Start the server (use a non-default port if another instance is already running):
+
+```bash
+cd /path/to/junos-mcp-server-cg
+JMCP_ARTIFACT_BACKEND=redis JMCP_BATCH_RESPONSE_MODE=artifact \
+JMCP_ARTIFACT_REDIS_HOST=127.0.0.1 JMCP_ARTIFACT_REDIS_PORT=6379 JMCP_ARTIFACT_REDIS_DB=0 \
+/path/to/python jmcp.py -t streamable-http -H 127.0.0.1 -p 30031 -f devices.json
+```
+
+Then run the smoke test:
+
+```bash
+cd /path/to/junos-mcp-server-cg
+/path/to/python tools/http_smoke_test.py --base-url http://127.0.0.1:30031/mcp/v1/sse
+```
+
+What it validates:
+- `tools/list` and `get_router_list`
+- `execute_junos_command_batch` with `response_mode=artifact`
+- artifact persistence + retrieval via `list_artifacts` and `read_artifact` (when those tools are exposed over the same transport)
+
+### 3) Stability/permutation testing (HTTP regression matrix)
+
+For broader stability validation across many permutations (pooled vs fresh sessions, fallback behavior, response_mode variants, and negative cases), run:
+
+```bash
+cd /path/to/junos-mcp-server-cg
+/path/to/python tools/regression_matrix_http.py --max-routers 2 --max-cases 25
+```
+
+It starts a temporary JMCP server on a free port and writes a JSON report under `artifacts/`.
 
 ---
 
@@ -400,6 +462,73 @@ Options:
 **SUCCESS / FAILURE SEMANTICS (Batch Tools):**
 - For `execute_junos_command_batch` and `execute_junos_commands_batch`, a command is counted as **failed** if the returned output looks like an error string (e.g. starts with `Connection error`, `An error occurred`, or `Error:`).
 - This matters for platforms like cRPD where unsupported commands can return an RPC error message; those are now reported as failures (instead of being counted as successful just because a string was returned).
+
+---
+
+## ⚠️ System Resource Caveats
+
+When running JMCP with many concurrent connections (e.g., 100+ routers), you may encounter **"too many open files"** errors if your system's file descriptor limit is too low.
+
+### Check Current Limit
+```bash
+ulimit -n              # Current shell limit
+sysctl kern.maxfiles   # macOS system-wide limit
+sysctl fs.file-max     # Linux system-wide limit
+```
+
+### Temporary Solution (Current Session Only)
+These changes only last until reboot:
+
+**macOS:**
+```bash
+ulimit -n 65536
+sudo sysctl -w kern.maxfiles=1048576
+sudo sysctl -w kern.maxfilesperproc=1048576
+```
+
+**Linux:**
+```bash
+ulimit -n 65536
+sudo sysctl -w fs.file-max=1048576
+sudo sysctl -w fs.nr_open=1048576
+```
+
+### Persistent Solution (Survives Reboot)
+
+**macOS:**
+```bash
+# Create or edit /etc/sysctl.conf
+sudo nano /etc/sysctl.conf
+
+# Add these lines:
+kern.maxfiles=1048576
+kern.maxfilesperproc=1048576
+
+# Apply immediately
+sudo sysctl -p
+```
+
+**Linux:**
+```bash
+# Create /etc/sysctl.d/99-jmcp.conf
+sudo nano /etc/sysctl.d/99-jmcp.conf
+
+# Add these lines:
+fs.file-max=1048576
+fs.nr_open=1048576
+
+# Apply immediately
+sudo sysctl -p /etc/sysctl.d/99-jmcp.conf
+
+# For per-user limits, edit /etc/security/limits.conf
+sudo nano /etc/security/limits.conf
+
+# Add these lines:
+* soft nofile 65536
+* hard nofile 1048576
+```
+
+**Note:** The connection pool mitigates this issue by reusing persistent sessions (1 per router) rather than creating new connections per command. Systems with limits ≥ 65536 are generally sufficient for most deployments.
 
 ---
 

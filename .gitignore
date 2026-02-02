@@ -53,9 +53,17 @@ id_ed25519*
 .env.production
 devices.json
 
+# Local inventory merge inputs / backups
+devices.json.bak_*
+to_be_merged_devices_json/
+
 # Backup files
 *.bak
 *.backup
+
+# Generated regression artifacts (kept local)
+artifacts/regression-matrix-*.json
+artifacts/*reg-matrix-*.json
 
 # Power point files
 *.pptx

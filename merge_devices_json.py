@@ -115,11 +115,17 @@ def merge_devices(
 
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
-        description="Merge 3 device-mapping JSON files into devices.json",
+        description="Merge device-mapping JSON files into devices.json",
     )
-    parser.add_argument("input1", type=Path, help="First input JSON file")
-    parser.add_argument("input2", type=Path, help="Second input JSON file")
-    parser.add_argument("input3", type=Path, help="Third input JSON file")
+    parser.add_argument("input1", type=Path, nargs="?", help="First input JSON file")
+    parser.add_argument("input2", type=Path, nargs="?", help="Second input JSON file")
+    parser.add_argument("input3", type=Path, nargs="?", help="Third input JSON file")
+    parser.add_argument(
+        "-d",
+        "--directory",
+        type=Path,
+        help="Directory to search for all JSON files to merge (alternative to specifying individual files)",
+    )
     parser.add_argument(
         "-o",
         "--output",
@@ -151,7 +157,24 @@ def main(argv: list[str]) -> int:
 
     args = parser.parse_args(argv)
 
-    input_paths = [args.input1, args.input2, args.input3]
+    # Determine input paths
+    if args.directory:
+        if any([args.input1, args.input2, args.input3]):
+            raise SystemExit("Cannot specify both -d/--directory and individual input files")
+        
+        if not args.directory.exists():
+            raise SystemExit(f"Directory not found: {args.directory}")
+        if not args.directory.is_dir():
+            raise SystemExit(f"Not a directory: {args.directory}")
+        
+        # Find all JSON files in the directory
+        input_paths = sorted(args.directory.glob("*.json"))
+        if not input_paths:
+            raise SystemExit(f"No JSON files found in directory: {args.directory}")
+    else:
+        if not all([args.input1, args.input2, args.input3]):
+            raise SystemExit("Must specify either -d/--directory or all three input files (input1, input2, input3)")
+        input_paths = [args.input1, args.input2, args.input3]
     merged, conflicts = merge_devices(input_paths, prefer=args.prefer)
 
     if not args.no_validate:

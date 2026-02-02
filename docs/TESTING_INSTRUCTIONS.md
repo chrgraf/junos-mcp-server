@@ -9,7 +9,7 @@ The MCP server runs in **HTTP mode** by default (`streamable-http`), not `stdio`
 ### Step 1: Start the Server
 
 ```bash
-cd /Users/behn66googlemail.com/Library/CloudStorage/OneDrive-HewlettPackardEnterprise/github/mcp_server/patched
+cd /Users/behn66googlemail.com/Library/CloudStorage/OneDrive-HewlettPackardEnterprise/github/mcp_server/junos-mcp-server-cg
 source /Users/behn66googlemail.com/Library/CloudStorage/OneDrive-HewlettPackardEnterprise/github/.venv/bin/activate
 python3 jmcp.py
 ```
@@ -19,9 +19,24 @@ Server will start on: `http://127.0.0.1:30030`
 ### Step 2: Run the Test (in another terminal)
 
 ```bash
-cd /Users/behn66googlemail.com/Library/CloudStorage/OneDrive-HewlettPackardEnterprise/github/mcp_server/patched
+cd /Users/behn66googlemail.com/Library/CloudStorage/OneDrive-HewlettPackardEnterprise/github/mcp_server/junos-mcp-server-cg
 source /Users/behn66googlemail.com/Library/CloudStorage/OneDrive-HewlettPackardEnterprise/github/.venv/bin/activate
 python3 tools/test_batch_simple.py
+```
+
+## Extended stability testing: regression matrix runner
+
+For higher confidence, run the HTTP SSE regression matrix. It starts a temporary JMCP server on a free port, runs many permutations (pooled/fresh, fallback on/off, response_mode variants, negative cases), then writes a JSON report under `artifacts/`.
+
+```bash
+cd /Users/behn66googlemail.com/Library/CloudStorage/OneDrive-HewlettPackardEnterprise/github/mcp_server/junos-mcp-server-cg
+source /Users/behn66googlemail.com/Library/CloudStorage/OneDrive-HewlettPackardEnterprise/github/.venv/bin/activate
+
+# Quick but meaningful coverage (recommended default)
+python3 tools/regression_matrix_http.py --max-routers 2 --max-cases 25
+
+# More permutations (slower)
+python3 tools/regression_matrix_http.py --max-routers 3 --max-cases 60 --include-barrier --include-artifact-backends
 ```
 
 This will test progressively:
