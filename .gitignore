@@ -65,5 +65,8 @@ to_be_merged_devices_json/
 artifacts/regression-matrix-*.json
 artifacts/*reg-matrix-*.json
 
+# Generated disk artifacts (kept local)
+artifacts/*.json
+
 # Power point files
 *.pptx
