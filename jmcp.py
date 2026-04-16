@@ -179,6 +179,14 @@ def _truthy_env(var_name: str) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _artifact_fail_closed_enabled() -> bool:
+    """If true, do not fall back to disk when Redis was requested.
+
+    Controlled by env var: JMCP_ARTIFACT_FAIL_CLOSED=true
+    """
+    return _truthy_env("JMCP_ARTIFACT_FAIL_CLOSED")
+
+
 def _get_artifact_backend(arguments: dict | None = None) -> str:
     """Resolve artifact backend.
 
@@ -360,7 +368,7 @@ def _get_artifact_store(arguments: dict | None = None) -> ArtifactStore:
         return store
 
     if backend == "dual":
-        # Default: Redis is primary, disk is secondary.
+        # Default: disk is primary (always works), Redis is best-effort secondary.
         cache_key = (
             "dual",
             redis_url,
@@ -373,7 +381,8 @@ def _get_artifact_store(arguments: dict | None = None) -> ArtifactStore:
         )
         store = _ARTIFACT_STORE_CACHE.get(cache_key)
         if store is None:
-            primary = RedisArtifactStore(
+            primary = DiskArtifactStore(artifact_dir)
+            secondary = RedisArtifactStore(
                 redis_url=redis_url,
                 key_prefix=redis_prefix,
                 ttl_seconds=ttl_seconds,
@@ -381,7 +390,6 @@ def _get_artifact_store(arguments: dict | None = None) -> ArtifactStore:
                 max_bytes=max_bytes,
                 reserve_bytes=reserve_bytes,
             )
-            secondary = DiskArtifactStore(artifact_dir)
             store = DualArtifactStore(primary=primary, secondary=secondary)
             _ARTIFACT_STORE_CACHE[cache_key] = store
         return store
@@ -446,9 +454,52 @@ async def _persist_json_artifact(*, tool_name: str, payload: dict[str, Any], arg
     now = datetime.now(timezone.utc)
     store = _get_artifact_store(arguments)
 
+    requested_backend = _get_artifact_backend(arguments)
+    artifact_dir = _get_artifact_dir(arguments or {})
+
+    strict_backend = _artifact_fail_closed_enabled()
+
+    def _backend_help_payload(*, error: Exception) -> dict[str, Any]:
+        """Return a small, actionable help payload suitable for LLM/tool output."""
+        # Keep this compact: enough to self-heal without overwhelming the model.
+        return {
+            "warning": "artifact_persistence_degraded",
+            "requested_backend": requested_backend,
+            "fallback_backend": "disk",
+            "reason": str(error),
+            "how_to_fix": {
+                "prefer_disk": {
+                    "JMCP_ARTIFACT_BACKEND": "disk",
+                    "JMCP_ARTIFACT_DIR": artifact_dir,
+                },
+                "use_redis": {
+                    "note": "Ensure Redis is reachable and JMCP has python 'redis' installed.",
+                    "env": {
+                        "JMCP_ARTIFACT_BACKEND": "redis",
+                        "JMCP_REDIS_URL": "redis://<user>:<pass>@<host>:6379/0",
+                    },
+                },
+                "strict_mode": {
+                    "JMCP_ARTIFACT_FAIL_CLOSED": "true",
+                    "note": "If true, JMCP will fail instead of falling back to disk."
+                },
+            },
+        }
+
     def _do_write() -> dict[str, Any]:
-        ptr = store.write_json(tool_name=tool_name, payload=payload, label=label, created_at=now)
-        return ptr.as_dict()
+        try:
+            ptr = store.write_json(tool_name=tool_name, payload=payload, label=label, created_at=now)
+            return ptr.as_dict()
+        except Exception as e:
+            # Self-healing: if Redis was requested but is unavailable, fall back to disk
+            # (unless strict mode is enabled). This avoids losing data when Redis is down.
+            if (not strict_backend) and requested_backend == "redis":
+                fallback_store = DiskArtifactStore(artifact_dir)
+                ptr = fallback_store.write_json(tool_name=tool_name, payload=payload, label=label, created_at=now)
+                out = ptr.as_dict()
+                out["warnings"] = [_backend_help_payload(error=e)]
+                return out
+            raise
 
     return await anyio.to_thread.run_sync(_do_write, limiter=thread_limiter)
 
@@ -498,6 +549,34 @@ def _find_artifact_by_run_id(run_id: str, artifact_dir: str) -> str | None:
         return candidates[0]
     except Exception:
         return None
+
+
+def _artifact_backend_fallback_warning(*, operation: str, requested_backend: str, artifact_dir: str, reason: str) -> dict[str, Any]:
+    """Compact, actionable warning payload for Redis->disk fallback paths."""
+    return {
+        "warning": "artifact_backend_fallback",
+        "operation": operation,
+        "requested_backend": requested_backend,
+        "fallback_backend": "disk",
+        "reason": reason,
+        "how_to_fix": {
+            "prefer_disk": {
+                "JMCP_ARTIFACT_BACKEND": "disk",
+                "JMCP_ARTIFACT_DIR": artifact_dir,
+            },
+            "use_redis": {
+                "note": "Ensure Redis is reachable and JMCP has python 'redis' installed.",
+                "env": {
+                    "JMCP_ARTIFACT_BACKEND": "redis",
+                    "JMCP_REDIS_URL": "redis://<user>:<pass>@<host>:6379/0",
+                },
+            },
+            "strict_mode": {
+                "JMCP_ARTIFACT_FAIL_CLOSED": "true",
+                "note": "If true, JMCP will fail instead of falling back to disk.",
+            },
+        },
+    }
 
 
 def _truncate_text(text: str, max_chars: int) -> str:
@@ -956,15 +1035,45 @@ async def handle_list_artifacts(arguments: dict, context: Context) -> list[types
     try:
         store = _get_artifact_store(arguments)
     except Exception as e:
-        return [types.TextContent(
-            type="text",
-            text=json.dumps({
-                "error": "artifact_store_unavailable",
-                "backend": backend,
+        fallback = None
+        if backend == "redis":
+            try:
+                fallback = DiskArtifactStore(artifact_dir).list(
+                    tool=tool_filter,
+                    label_contains=label_contains,
+                    since_epoch=since_epoch,
+                    limit=limit,
+                )
+            except Exception:
+                fallback = None
+
+        if fallback is not None:
+            payload: dict[str, Any] = {
+                "backend": "disk",
+                "requested_backend": backend,
                 "artifact_dir": artifact_dir,
-                "message": str(e),
-            }, indent=2, ensure_ascii=False),
-        )]
+                "count": len(fallback),
+                "artifacts": fallback,
+                "warnings": [_artifact_backend_fallback_warning(
+                    operation="list_artifacts",
+                    requested_backend=backend,
+                    artifact_dir=artifact_dir,
+                    reason=str(e),
+                )],
+            }
+            return [types.TextContent(type="text", text=json.dumps(payload, indent=2, ensure_ascii=False))]
+
+        payload: dict[str, Any] = {
+            "error": "artifact_store_unavailable",
+            "backend": backend,
+            "artifact_dir": artifact_dir,
+            "message": str(e),
+            "how_to_fix": {
+                "prefer_disk": {"JMCP_ARTIFACT_BACKEND": "disk", "JMCP_ARTIFACT_DIR": artifact_dir},
+                "use_redis": {"JMCP_ARTIFACT_BACKEND": "redis", "JMCP_REDIS_URL": "redis://<user>:<pass>@<host>:6379/0"},
+            },
+        }
+        return [types.TextContent(type="text", text=json.dumps(payload, indent=2, ensure_ascii=False))]
 
     def _do_list() -> list[dict[str, Any]]:
         return store.list(
@@ -977,15 +1086,45 @@ async def handle_list_artifacts(arguments: dict, context: Context) -> list[types
     try:
         artifacts = await anyio.to_thread.run_sync(_do_list, limiter=thread_limiter)
     except Exception as e:
-        return [types.TextContent(
-            type="text",
-            text=json.dumps({
-                "error": "list_failed",
-                "backend": backend,
+        fallback = None
+        if backend == "redis":
+            try:
+                fallback = DiskArtifactStore(artifact_dir).list(
+                    tool=tool_filter,
+                    label_contains=label_contains,
+                    since_epoch=since_epoch,
+                    limit=limit,
+                )
+            except Exception:
+                fallback = None
+
+        if fallback is not None:
+            payload: dict[str, Any] = {
+                "backend": "disk",
+                "requested_backend": backend,
                 "artifact_dir": artifact_dir,
-                "message": str(e),
-            }, indent=2, ensure_ascii=False),
-        )]
+                "count": len(fallback),
+                "artifacts": fallback,
+                "warnings": [_artifact_backend_fallback_warning(
+                    operation="list_artifacts",
+                    requested_backend=backend,
+                    artifact_dir=artifact_dir,
+                    reason=str(e),
+                )],
+            }
+            return [types.TextContent(type="text", text=json.dumps(payload, indent=2, ensure_ascii=False))]
+
+        payload: dict[str, Any] = {
+            "error": "list_failed",
+            "backend": backend,
+            "artifact_dir": artifact_dir,
+            "message": str(e),
+            "how_to_fix": {
+                "prefer_disk": {"JMCP_ARTIFACT_BACKEND": "disk", "JMCP_ARTIFACT_DIR": artifact_dir},
+                "use_redis": {"JMCP_ARTIFACT_BACKEND": "redis", "JMCP_REDIS_URL": "redis://<user>:<pass>@<host>:6379/0"},
+            },
+        }
+        return [types.TextContent(type="text", text=json.dumps(payload, indent=2, ensure_ascii=False))]
 
     return [types.TextContent(
         type="text",
@@ -1994,6 +2133,27 @@ def get_timeout_with_fallback(arguments_timeout: int = None) -> int:
             log.warning(f"Invalid JUNOS_TIMEOUT environment variable value: {env_timeout}. Using default timeout.")
 
     return 360
+
+def get_stateless_with_fallback(default: bool = False) -> bool:
+    """Get stateless mode from JMCP_STATELESS environment variable with safe fallback."""
+    env_stateless = os.getenv('JMCP_STATELESS')
+    if env_stateless is None:
+        return default
+
+    normalized_value = env_stateless.strip().lower()
+    truthy_values = {'1', 'true', 'yes', 'y', 'on'}
+    falsy_values = {'0', 'false', 'no', 'n', 'off'}
+
+    if normalized_value in truthy_values:
+        return True
+    if normalized_value in falsy_values:
+        return False
+
+    log.warning(
+        f"Invalid JMCP_STATELESS environment variable value: {env_stateless}. "
+        f"Using default stateless={default}."
+    )
+    return default
 
 def validate_token_from_file(token: str) -> bool:
     """Validate if a token exists in the .tokens file"""
@@ -3682,6 +3842,9 @@ async def handle_read_artifact(arguments: dict, context: Context) -> list[types.
     backend = _get_artifact_backend(arguments)
     artifact_dir = _get_artifact_dir(arguments)
 
+    disk_fallback_used = False
+    disk_fallback_reason: str | None = None
+
     resolved_path: str | None = None
 
     if isinstance(artifact_path, str) and artifact_path.strip():
@@ -3719,46 +3882,122 @@ async def handle_read_artifact(arguments: dict, context: Context) -> list[types.
             )]
     elif isinstance(run_id, str) and run_id.strip():
         rid = run_id.strip()
+        store: ArtifactStore | None = None
+        loaded_from_disk = False
+
         try:
             store = _get_artifact_store(arguments)
         except Exception as e:
-            return [types.TextContent(
-                type="text",
-                text=json.dumps({
-                    "error": "artifact_store_unavailable",
-                    "backend": backend,
-                    "artifact_dir": artifact_dir,
-                    "run_id": rid,
-                    "message": str(e),
-                }, indent=2, ensure_ascii=False),
-            )]
+            if backend == "redis":
+                disk_path = _find_artifact_by_run_id(rid, artifact_dir)
+                if disk_path:
+                    try:
+                        with open(disk_path, "r", encoding="utf-8") as f:
+                            artifact_obj = json.loads(f.read())
+                        resolved_path = disk_path
+                        loaded_from_disk = True
+                        disk_fallback_used = True
+                        disk_fallback_reason = str(e)
+                    except Exception:
+                        loaded_from_disk = False
 
-        def _do_read() -> dict[str, Any]:
-            return store.read_json(run_id=rid)
+                if not loaded_from_disk:
+                    return [types.TextContent(
+                        type="text",
+                        text=json.dumps({
+                            "error": "artifact_store_unavailable",
+                            "backend": backend,
+                            "artifact_dir": artifact_dir,
+                            "run_id": rid,
+                            "message": str(e),
+                            "how_to_fix": {
+                                "prefer_disk": {"JMCP_ARTIFACT_BACKEND": "disk", "JMCP_ARTIFACT_DIR": artifact_dir},
+                                "use_redis": {"JMCP_ARTIFACT_BACKEND": "redis", "JMCP_REDIS_URL": "redis://<user>:<pass>@<host>:6379/0"},
+                            },
+                        }, indent=2, ensure_ascii=False),
+                    )]
+            else:
+                return [types.TextContent(
+                    type="text",
+                    text=json.dumps({
+                        "error": "artifact_store_unavailable",
+                        "backend": backend,
+                        "artifact_dir": artifact_dir,
+                        "run_id": rid,
+                        "message": str(e),
+                    }, indent=2, ensure_ascii=False),
+                )]
 
-        try:
-            artifact_obj = await anyio.to_thread.run_sync(_do_read, limiter=thread_limiter)
-        except FileNotFoundError:
-            return [types.TextContent(
-                type="text",
-                text=json.dumps({
-                    "error": "artifact_not_found",
-                    "backend": backend,
-                    "artifact_dir": artifact_dir,
-                    "run_id": rid,
-                }, indent=2, ensure_ascii=False),
-            )]
-        except Exception as e:
-            return [types.TextContent(
-                type="text",
-                text=json.dumps({
-                    "error": "artifact_read_failed",
-                    "backend": backend,
-                    "artifact_dir": artifact_dir,
-                    "run_id": rid,
-                    "message": str(e),
-                }, indent=2, ensure_ascii=False),
-            )]
+        if not loaded_from_disk:
+            if store is None:
+                return [types.TextContent(
+                    type="text",
+                    text=json.dumps({
+                        "error": "artifact_store_unavailable",
+                        "backend": backend,
+                        "artifact_dir": artifact_dir,
+                        "run_id": rid,
+                        "message": "artifact store not initialized",
+                    }, indent=2, ensure_ascii=False),
+                )]
+
+            def _do_read() -> dict[str, Any]:
+                return store.read_json(run_id=rid)
+
+            try:
+                artifact_obj = await anyio.to_thread.run_sync(_do_read, limiter=thread_limiter)
+            except FileNotFoundError:
+                return [types.TextContent(
+                    type="text",
+                    text=json.dumps({
+                        "error": "artifact_not_found",
+                        "backend": backend,
+                        "artifact_dir": artifact_dir,
+                        "run_id": rid,
+                    }, indent=2, ensure_ascii=False),
+                )]
+            except Exception as e:
+                if backend == "redis":
+                    disk_path = _find_artifact_by_run_id(rid, artifact_dir)
+                    if disk_path:
+                        try:
+                            with open(disk_path, "r", encoding="utf-8") as f:
+                                artifact_obj = json.loads(f.read())
+                            resolved_path = disk_path
+                            loaded_from_disk = True
+                            disk_fallback_used = True
+                            disk_fallback_reason = str(e)
+                        except Exception:
+                            loaded_from_disk = False
+
+                    if not loaded_from_disk:
+                        return [types.TextContent(
+                            type="text",
+                            text=json.dumps({
+                                "error": "artifact_read_failed",
+                                "backend": backend,
+                                "artifact_dir": artifact_dir,
+                                "run_id": rid,
+                                "message": str(e),
+                                "how_to_fix": {
+                                    "prefer_disk": {"JMCP_ARTIFACT_BACKEND": "disk", "JMCP_ARTIFACT_DIR": artifact_dir},
+                                    "use_redis": {"JMCP_ARTIFACT_BACKEND": "redis", "JMCP_REDIS_URL": "redis://<user>:<pass>@<host>:6379/0"},
+                                },
+                            }, indent=2, ensure_ascii=False),
+                        )]
+
+                    # Disk fallback succeeded: continue to normal view rendering.
+                else:
+                    return [types.TextContent(
+                        type="text",
+                        text=json.dumps({
+                            "error": "artifact_read_failed",
+                            "backend": backend,
+                            "artifact_dir": artifact_dir,
+                            "run_id": rid,
+                            "message": str(e),
+                        }, indent=2, ensure_ascii=False),
+                    )]
     else:
         return [types.TextContent(
             type="text",
@@ -3799,7 +4038,18 @@ async def handle_read_artifact(arguments: dict, context: Context) -> list[types.
     if filter_meta is not None and isinstance(view, dict):
         view["filter"] = filter_meta
 
-    view["backend"] = backend
+    if disk_fallback_used and backend == "redis":
+        view.setdefault("warnings", []).append(_artifact_backend_fallback_warning(
+            operation="read_artifact",
+            requested_backend=backend,
+            artifact_dir=artifact_dir,
+            reason=disk_fallback_reason or "redis unavailable",
+        ))
+        view["requested_backend"] = backend
+        view["backend"] = "disk"
+    else:
+        view["backend"] = backend
+
     if resolved_path is not None:
         view["artifact_path"] = resolved_path
     view.setdefault("artifact_dir", artifact_dir)
@@ -4028,7 +4278,7 @@ TOOL_HANDLERS = {
 
 def create_mcp_server() -> Server:
     """Create and configure the MCP server with all tools"""
-    app = Server(JUNOS_MCP, version="1.0.0")
+    app = Server(JUNOS_MCP, version="1.1.0")
     
     @app.call_tool()
     async def call_tool(name: str, arguments: dict) -> list[types.ContentBlock]:
@@ -4503,6 +4753,79 @@ TCP SESSION BEHAVIOR:
     • SEQUENTIAL per router: Each router's commands run one-by-one
     • Total time ≈ time for commands on slowest router (NOT 50×12×time)
     • Pool eliminates reconnections between commands (15-100x faster!)
+
+ARTIFACT STORAGE (via Environment Variables):
+  
+  Artifacts enable storing large command outputs (configs, routing tables) separately
+  to reduce token consumption and improve performance. Controlled via ENV VARS, not CLI args.
+  
+  BASIC ARTIFACT CONFIGURATION:
+    # Set artifact backend (options: "disk", "redis", "none")
+    export JMCP_ARTIFACT_BACKEND=redis
+    
+    # Set default response mode for batch operations
+    export JMCP_BATCH_RESPONSE_MODE=artifact
+    
+    # Then start server normally
+    python jmcp.py -p 30031
+  
+  REDIS CONFIGURATION:
+    # Connection via URL (highest priority)
+    export JMCP_ARTIFACT_REDIS_URL=redis://localhost:6379/0
+    
+    # OR via individual parameters
+    export JMCP_ARTIFACT_REDIS_HOST=127.0.0.1
+    export JMCP_ARTIFACT_REDIS_PORT=6379
+    export JMCP_ARTIFACT_REDIS_DB=0
+    
+    # Optional Redis authentication
+    export JMCP_ARTIFACT_REDIS_USERNAME=myuser
+    export JMCP_ARTIFACT_REDIS_PASSWORD=mypass
+    
+    # Optional Redis tuning
+    export JMCP_ARTIFACT_REDIS_PREFIX=jmcp:           # Key prefix (default: none)
+    export JMCP_ARTIFACT_REDIS_TTL_SECONDS=604800     # 7 days (default)
+    export JMCP_ARTIFACT_REDIS_MAX_BYTES=10000000     # Max artifact size
+    export JMCP_ARTIFACT_REDIS_RESERVE_BYTES=5000000  # Reserved space (default)
+    export JMCP_ARTIFACT_GZIP=true                    # Enable compression
+  
+  DISK CONFIGURATION:
+    export JMCP_ARTIFACT_BACKEND=disk
+    export JMCP_ARTIFACT_DISK_DIR=./artifacts         # Storage directory (default)
+    export JMCP_ARTIFACT_GZIP=true                    # Enable compression
+  
+  FAIL-CLOSED MODE:
+    export JMCP_ARTIFACT_FAIL_CLOSED=true  # Reject requests if artifact storage fails
+  
+  TOOL ARGUMENT OVERRIDE:
+    Tool calls can override per-request:
+    {
+      "name": "execute_junos_command_batch",
+      "arguments": {
+        "router_names": ["r1", "r2"],
+        "command": "show configuration",
+        "response_mode": "artifact",      # Options: "inline", "artifact", "auto"
+        "artifact_backend": "redis",      # Override JMCP_ARTIFACT_BACKEND
+        "persist_to_redis": true          # Force persist to Redis
+      }
+    }
+  
+  TYPICAL WORKFLOW:
+    1. Start Redis: redis-server
+    2. Configure environment:
+       export JMCP_ARTIFACT_BACKEND=redis
+       export JMCP_BATCH_RESPONSE_MODE=artifact
+    3. Start server: python jmcp.py -p 30031
+    4. Large outputs stored in Redis, only metadata returned
+    5. Retrieve via read_artifact tool using artifact_id
+  
+  WHEN TO USE ARTIFACTS:
+    ✓ Large configurations (show configuration | display inheritance)
+    ✓ Routing tables (show route extensive)
+    ✓ Batch operations with 20+ routers
+    ✓ Repeated data retrieval (cache-friendly)
+    ✗ Small outputs (show version)
+    ✗ Single router queries (overhead not worth it)
         """
     )
     
@@ -4564,6 +4887,13 @@ TCP SESSION BEHAVIOR:
         type=int,
         default=30,
         help='Connection pool health check interval in seconds (default: 30). Pool enabled by default'
+    )
+    
+    parser.add_argument(
+        '--max-commands-per-connection',
+        type=int,
+        default=5,
+        help='Max commands per TCP session before forcing reconnect (default: 5, prevents stale connections)'
     )
 
     
@@ -4652,6 +4982,7 @@ TCP SESSION BEHAVIOR:
         prepare_connection_params_func=prepare_connection_params,
         max_idle_time=args.idle_timeout,
         health_check_interval=args.health_check_interval,
+        max_commands_per_connection=args.max_commands_per_connection,
         enabled=not args.disable_connection_pool
     )
 
@@ -4688,10 +5019,16 @@ TCP SESSION BEHAVIOR:
         elif args.transport == 'streamable-http':
             # For streamable-http, create Starlette app with session manager
             async def run_streamable_http():
+                stateless_mode = get_stateless_with_fallback(default=False)
                 session_manager = StreamableHTTPSessionManager(
                     app=mcp_server,
                     event_store=None,  # No persistence
-                    stateless=True  # Stateless mode for VS Code compatibility
+                    stateless=stateless_mode
+                )
+
+                log.info(
+                    f"Streamable HTTP session mode: {'stateless' if stateless_mode else 'stateful'} "
+                    f"(controlled by JMCP_STATELESS, default false)"
                 )
                 
                 # ASGI handler
