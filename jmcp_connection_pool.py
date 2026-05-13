@@ -171,6 +171,7 @@ class JunosConnectionPool:
         prepare_connection_params_func: Callable[[dict, str], dict] | None = None,
         max_idle_time: int = 300,  # 5 minutes
         health_check_interval: int = 30,  # 30 seconds
+        max_commands_per_connection: int = 5,  # Max commands before forcing reconnect
         enabled: bool = True,
         # Backward-compatible aliases (used in older docs/examples)
         idle_timeout: int | None = None,
@@ -184,6 +185,7 @@ class JunosConnectionPool:
             prepare_connection_params_func: Function to prepare PyEZ connection params
             max_idle_time: Close connections idle for this many seconds
             health_check_interval: Run health checks every N seconds
+            max_commands_per_connection: Max commands per TCP session before reconnect (prevents stale connections)
             enabled: Whether pooling is enabled (can disable for debugging)
         """
         self.devices_map = devices_map
@@ -197,6 +199,7 @@ class JunosConnectionPool:
         self.prepare_connection_params = prepare_connection_params_func or _default_prepare_connection_params
         self.max_idle_time = max_idle_time
         self.health_check_interval = health_check_interval
+        self.max_commands_per_connection = max_commands_per_connection
         self.enabled = enabled
         
         # Connection storage
@@ -230,7 +233,8 @@ class JunosConnectionPool:
         log.info(
             f"Connection pool started "
             f"(idle_timeout={self.max_idle_time}s, "
-            f"health_check={self.health_check_interval}s)"
+            f"health_check={self.health_check_interval}s, "
+            f"max_commands={self.max_commands_per_connection})"
         )
     
     async def stop(self):
@@ -309,11 +313,24 @@ class JunosConnectionPool:
         await conn_wrapper.lock.acquire()
         
         try:
-            # Step 3: Check if device is connected
+            # Step 3: Check if connection has exceeded max commands (force refresh)
+            if conn_wrapper.is_connected() and conn_wrapper.stats.total_commands >= self.max_commands_per_connection:
+                log.info(
+                    f"Connection to {router_name} exceeded max commands "
+                    f"({conn_wrapper.stats.total_commands}/{self.max_commands_per_connection}), "
+                    f"closing for refresh"
+                )
+                await self._close_device(conn_wrapper)
+                self.metrics["command_limit_closures"] = self.metrics.get("command_limit_closures", 0) + 1
+            
+            # Step 4: Check if device is connected
             if not conn_wrapper.is_connected():
                 # Need to (re)connect
                 await self._connect_device(conn_wrapper)
                 self.metrics["connection_misses"] += 1
+                # Reset stats for new connection
+                conn_wrapper.stats.total_commands = 0
+                conn_wrapper.stats.total_errors = 0
                 log.info(
                     f"Opened new connection to {router_name} "
                     f"(total: {len([c for c in self.connections.values() if c.is_connected()])})"
@@ -322,7 +339,8 @@ class JunosConnectionPool:
                 self.metrics["connection_hits"] += 1
                 log.debug(
                     f"Reusing connection to {router_name} "
-                    f"(age: {conn_wrapper.age():.1f}s, idle: {conn_wrapper.idle_time():.1f}s)"
+                    f"(age: {conn_wrapper.age():.1f}s, idle: {conn_wrapper.idle_time():.1f}s, "
+                    f"commands: {conn_wrapper.stats.total_commands}/{self.max_commands_per_connection})"
                 )
             
             # Step 4: Mark as in-use and return device

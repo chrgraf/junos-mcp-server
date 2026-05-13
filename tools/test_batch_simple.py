@@ -48,7 +48,7 @@ results = []
 
 # Note: Server must be running on http://127.0.0.1:30030
 print("📝 NOTE: Please start the server first:")
-print("   cd /path/to/patched && python3 jmcp.py")
+print("   cd <repo-root> && python3 jmcp.py")
 print()
 input("Press Enter when server is ready...")
 print()
