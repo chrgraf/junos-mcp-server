@@ -25,17 +25,17 @@ test-all: test
 # Run config validation tests
 test-config:
 	@echo "Running config validation tests..."
-	@uv run python test_config_validation.py
+	@uv run python tools/test_config_validation.py
 
 # Run get_router_list tests
 test-router-list:
 	@echo "Running get_router_list tests..."
-	@uv run python test_get_router_list.py
+	@uv run python tools/test_get_router_list.py
 
 # Run batch command example
 test-batch-command:
 	@echo "Running batch command example..."
-	@uv run python test_batch_command.py
+	@uv run python tools/test_batch_command.py
 
 # Build Docker image
 docker-build:

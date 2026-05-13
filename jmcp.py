@@ -22,8 +22,11 @@ from __future__ import annotations as _annotations
 import argparse
 import time
 from datetime import datetime, timezone
+import hashlib
 import logging
 import os
+import math
+import uuid
 from jinja2 import Environment, FileSystemLoader, TemplateNotFound
 import json
 import yaml
@@ -31,6 +34,7 @@ import sys
 import signal
 from typing import Any, Sequence
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Sequence
+from contextlib import suppress
 
 from typing import Dict, Any, Generic, Literal
 from pydantic import BaseModel, Field
@@ -44,6 +48,7 @@ from mcp.server.elicitation import (
 )
 
 import anyio
+from anyio import CapacityLimiter
 import mcp.types as types
 from mcp.server.lowlevel import Server
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
@@ -82,6 +87,17 @@ from jnpr.junos.exception import ConnectError, ConfigLoadError, CommitError, Loc
 from jnpr.junos.utils.config import Config
 
 from utils.config import prepare_connection_params, validate_device_config, validate_all_devices
+from jmcp_connection_pool import JunosConnectionPool
+
+from artifact_store import (
+    ArtifactStore,
+    ArtifactStoreError,
+    ArtifactStoreUnavailableError,
+    ArtifactTooLargeError,
+    DiskArtifactStore,
+    DualArtifactStore,
+    RedisArtifactStore,
+)
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -90,8 +106,1509 @@ log = logging.getLogger('jmcp-server')
 # Global variable for devices (parsed from JSON file)
 devices = {}
 
+# Global connection pool (initialized in main())
+connection_pool: JunosConnectionPool | None = None
+
 # Junos MCP Server
 JUNOS_MCP = 'jmcp-server'
+
+def _default_max_workers() -> int:
+        """Compute a conservative default worker count.
+
+    Heuristic: $\\lceil cpu\\_cores \\times 1.5 \\rceil$.
+
+        Notes:
+        - This workload is mostly network I/O bound, but excessive concurrency can
+            degrade performance (device-side limits, host scheduling, queueing).
+        - Apply a small floor for low-core systems and a safety cap for very large
+            hosts.
+        - Use `--workers-per-core` to scale up/down deterministically.
+        """
+
+        cpu_cores = os.cpu_count() or 4
+        desired = math.ceil(cpu_cores * 1.5)
+        return max(8, min(80, desired))
+
+
+# Thread pool configuration for I/O-bound SSH operations
+default_workers = _default_max_workers()
+
+# Note: MAX_WORKERS and thread_limiter will be initialized in main() after argument parsing
+MAX_WORKERS = default_workers
+thread_limiter = None
+
+# Operator-facing: the configured CLI value for `--workers-per-core` (or None).
+WORKERS_PER_CORE: float | None = None
+
+
+def _get_batch_response_mode() -> str:
+    """Return response mode for batch tools.
+
+    Modes:
+        - "full" (default): include full per-router/per-command outputs
+        - "summary": return only summary + small router metadata
+        - "artifact": persist full results to disk and return only summary + artifact pointer
+
+    Priority:
+        1) `JMCP_BATCH_RESPONSE_MODE` env var
+        2) `.jmcp_batch_response_mode` file next to this `jmcp.py`
+        3) default "full"
+    """
+    mode = os.getenv("JMCP_BATCH_RESPONSE_MODE")
+    if mode:
+        mode = mode.strip().lower()
+        if mode in {"full", "summary", "artifact"}:
+            return mode
+
+    config_path = os.path.join(os.path.dirname(__file__), ".jmcp_batch_response_mode")
+    try:
+        if os.path.exists(config_path):
+            raw = open(config_path, "r", encoding="utf-8").read().strip().lower()
+            if raw in {"full", "summary", "artifact"}:
+                return raw
+    except Exception as e:
+        log.warning(f"Failed to read {config_path}: {e}")
+
+    return "full"
+
+
+def _truthy_env(var_name: str) -> bool:
+    value = os.getenv(var_name)
+    if value is None:
+        return False
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _artifact_fail_closed_enabled() -> bool:
+    """If true, do not fall back to disk when Redis was requested.
+
+    Controlled by env var: JMCP_ARTIFACT_FAIL_CLOSED=true
+    """
+    return _truthy_env("JMCP_ARTIFACT_FAIL_CLOSED")
+
+
+def _get_artifact_backend(arguments: dict | None = None) -> str:
+    """Resolve artifact backend.
+
+    Priority:
+      1) tool argument `artifact_backend`
+      2) `JMCP_ARTIFACT_BACKEND` env var
+      3) `.jmcp_artifact_backend` file next to this `jmcp.py`
+      4) default: "disk"
+
+    Values: "disk", "redis", "dual".
+    """
+    if arguments:
+        arg_backend = arguments.get("artifact_backend")
+        if isinstance(arg_backend, str) and arg_backend.strip():
+            raw = arg_backend.strip().lower()
+            if raw in {"disk", "redis", "dual"}:
+                return raw
+
+    env_backend = os.getenv("JMCP_ARTIFACT_BACKEND")
+    if env_backend and env_backend.strip():
+        raw = env_backend.strip().lower()
+        if raw in {"disk", "redis", "dual"}:
+            return raw
+
+    config_path = os.path.join(os.path.dirname(__file__), ".jmcp_artifact_backend")
+    try:
+        if os.path.exists(config_path):
+            raw = open(config_path, "r", encoding="utf-8").read().strip().lower()
+            if raw in {"disk", "redis", "dual"}:
+                return raw
+    except Exception as e:
+        log.warning(f"Failed to read {config_path}: {e}")
+
+    return "disk"
+
+
+def _int_env(var_name: str, default: int | None = None) -> int | None:
+    raw = os.getenv(var_name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(raw.strip())
+    except Exception:
+        return default
+
+
+def _get_redis_url() -> str | None:
+    # Artifact-specific env var wins; then generic.
+    for name in ("JMCP_ARTIFACT_REDIS_URL", "JMCP_REDIS_URL"):
+        val = os.getenv(name)
+        if val and val.strip():
+            return val.strip()
+
+    # Convenience knobs: build a URL from host/port/(optional) auth.
+    host = _get_redis_host()
+    port = _get_redis_port()
+    db = _get_redis_db()
+    if host and port:
+        return _build_redis_url(host=host, port=port, db=db, username=_get_redis_username(), password=_get_redis_password())
+
+    return None
+
+
+def _get_redis_host() -> str:
+    # Default local Redis.
+    val = os.getenv("JMCP_ARTIFACT_REDIS_HOST") or os.getenv("JMCP_REDIS_HOST")
+    return val.strip() if val and val.strip() else "127.0.0.1"
+
+
+def _get_redis_port() -> int:
+    return _int_env("JMCP_ARTIFACT_REDIS_PORT", _int_env("JMCP_REDIS_PORT", 6379)) or 6379
+
+
+def _get_redis_db() -> int:
+    return _int_env("JMCP_ARTIFACT_REDIS_DB", _int_env("JMCP_REDIS_DB", 0)) or 0
+
+
+def _get_redis_username() -> str | None:
+    val = os.getenv("JMCP_ARTIFACT_REDIS_USERNAME") or os.getenv("JMCP_REDIS_USERNAME")
+    if val and val.strip():
+        return val.strip()
+    return None
+
+
+def _get_redis_password() -> str | None:
+    val = os.getenv("JMCP_ARTIFACT_REDIS_PASSWORD") or os.getenv("JMCP_REDIS_PASSWORD")
+    if val and val.strip():
+        return val.strip()
+    return None
+
+
+def _build_redis_url(*, host: str, port: int, db: int, username: str | None, password: str | None) -> str:
+    # Keep URL construction in one place; supports ACL auth when username is provided.
+    from urllib.parse import quote
+
+    auth = ""
+    if username and password:
+        auth = f"{quote(username)}:{quote(password)}@"
+    elif password and not username:
+        # Redis AUTH <password>
+        auth = f":{quote(password)}@"
+    elif username and not password:
+        # Unusual but valid in URL form.
+        auth = f"{quote(username)}@"
+
+    return f"redis://{auth}{host}:{int(port)}/{int(db)}"
+
+
+def _get_redis_prefix() -> str:
+    val = os.getenv("JMCP_ARTIFACT_REDIS_PREFIX")
+    return val.strip() if val and val.strip() else "jmcp:artifact"
+
+
+def _get_redis_ttl_seconds() -> int:
+    # Default TTL: one week. Set to 0 to disable expiration.
+    return _int_env("JMCP_ARTIFACT_REDIS_TTL_SECONDS", 604_800) or 0
+
+
+def _get_redis_max_bytes() -> int | None:
+    v = _int_env("JMCP_ARTIFACT_REDIS_MAX_BYTES", None)
+    if v is None or v <= 0:
+        return None
+    return v
+
+
+def _get_redis_reserve_bytes() -> int:
+    return _int_env("JMCP_ARTIFACT_REDIS_RESERVE_BYTES", 5_000_000) or 5_000_000
+
+
+def _get_artifact_gzip_enabled() -> bool:
+    # Global gzip knob; backend-specific knob supported for convenience.
+    if _truthy_env("JMCP_ARTIFACT_GZIP"):
+        return True
+    if _truthy_env("JMCP_ARTIFACT_REDIS_GZIP"):
+        return True
+    return False
+
+
+_ARTIFACT_STORE_CACHE: dict[tuple[Any, ...], ArtifactStore] = {}
+
+
+def _get_artifact_store(arguments: dict | None = None) -> ArtifactStore:
+    backend = _get_artifact_backend(arguments)
+    artifact_dir = _get_artifact_dir(arguments or {})
+
+    if backend == "disk":
+        cache_key = ("disk", artifact_dir)
+        store = _ARTIFACT_STORE_CACHE.get(cache_key)
+        if store is None:
+            store = DiskArtifactStore(artifact_dir)
+            _ARTIFACT_STORE_CACHE[cache_key] = store
+        return store
+
+    redis_url = _get_redis_url()
+    if not redis_url:
+        raise ArtifactStoreUnavailableError(
+            "Redis backend selected but no Redis URL configured (set JMCP_REDIS_URL or JMCP_ARTIFACT_REDIS_URL)."
+        )
+
+    redis_prefix = _get_redis_prefix()
+    ttl_seconds = _get_redis_ttl_seconds()
+    gzip_enabled = _get_artifact_gzip_enabled()
+    max_bytes = _get_redis_max_bytes()
+    reserve_bytes = _get_redis_reserve_bytes()
+
+    if backend == "redis":
+        cache_key = ("redis", redis_url, redis_prefix, ttl_seconds, gzip_enabled, max_bytes, reserve_bytes)
+        store = _ARTIFACT_STORE_CACHE.get(cache_key)
+        if store is None:
+            store = RedisArtifactStore(
+                redis_url=redis_url,
+                key_prefix=redis_prefix,
+                ttl_seconds=ttl_seconds,
+                gzip_enabled=gzip_enabled,
+                max_bytes=max_bytes,
+                reserve_bytes=reserve_bytes,
+            )
+            _ARTIFACT_STORE_CACHE[cache_key] = store
+        return store
+
+    if backend == "dual":
+        # Default: disk is primary (always works), Redis is best-effort secondary.
+        cache_key = (
+            "dual",
+            redis_url,
+            redis_prefix,
+            ttl_seconds,
+            gzip_enabled,
+            max_bytes,
+            reserve_bytes,
+            artifact_dir,
+        )
+        store = _ARTIFACT_STORE_CACHE.get(cache_key)
+        if store is None:
+            primary = DiskArtifactStore(artifact_dir)
+            secondary = RedisArtifactStore(
+                redis_url=redis_url,
+                key_prefix=redis_prefix,
+                ttl_seconds=ttl_seconds,
+                gzip_enabled=gzip_enabled,
+                max_bytes=max_bytes,
+                reserve_bytes=reserve_bytes,
+            )
+            store = DualArtifactStore(primary=primary, secondary=secondary)
+            _ARTIFACT_STORE_CACHE[cache_key] = store
+        return store
+
+    # Defensive fallback
+    return DiskArtifactStore(artifact_dir)
+
+
+def _get_artifact_dir(arguments: dict | None = None) -> str:
+    """Resolve artifact directory.
+
+    Priority:
+      1) tool argument `artifact_dir`
+      2) `JMCP_ARTIFACT_DIR` env var
+      3) `.jmcp_artifact_dir` file next to this `jmcp.py`
+      4) default: `<jmcp.py dir>/artifacts`
+    """
+    if arguments:
+        arg_dir = arguments.get("artifact_dir")
+        if isinstance(arg_dir, str) and arg_dir.strip():
+            return os.path.abspath(os.path.expanduser(arg_dir.strip()))
+
+    env_dir = os.getenv("JMCP_ARTIFACT_DIR")
+    if env_dir and env_dir.strip():
+        return os.path.abspath(os.path.expanduser(env_dir.strip()))
+
+    config_path = os.path.join(os.path.dirname(__file__), ".jmcp_artifact_dir")
+    try:
+        if os.path.exists(config_path):
+            raw = open(config_path, "r", encoding="utf-8").read().strip()
+            if raw:
+                return os.path.abspath(os.path.expanduser(raw))
+    except Exception as e:
+        log.warning(f"Failed to read {config_path}: {e}")
+
+    return os.path.abspath(os.path.join(os.path.dirname(__file__), "artifacts"))
+
+
+def _sanitize_artifact_label(label: str) -> str:
+    safe = "".join(ch if (ch.isalnum() or ch in {"-", "_"}) else "_" for ch in label.strip())
+    safe = safe.strip("_")
+    return safe[:80] if safe else "run"
+
+
+def _write_text_atomic(path: str, text: str) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp_path = f"{path}.tmp.{uuid.uuid4().hex}"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(tmp_path, path)
+
+
+async def _persist_json_artifact(*, tool_name: str, payload: dict[str, Any], arguments: dict | None = None) -> dict[str, Any]:
+    """Persist a JSON payload to the configured artifact backend and return a pointer dict."""
+
+    label = "run"
+    if arguments:
+        arg_label = arguments.get("artifact_label")
+        if isinstance(arg_label, str) and arg_label.strip():
+            label = _sanitize_artifact_label(arg_label)
+
+    now = datetime.now(timezone.utc)
+    store = _get_artifact_store(arguments)
+
+    requested_backend = _get_artifact_backend(arguments)
+    artifact_dir = _get_artifact_dir(arguments or {})
+
+    strict_backend = _artifact_fail_closed_enabled()
+
+    def _backend_help_payload(*, error: Exception) -> dict[str, Any]:
+        """Return a small, actionable help payload suitable for LLM/tool output."""
+        # Keep this compact: enough to self-heal without overwhelming the model.
+        return {
+            "warning": "artifact_persistence_degraded",
+            "requested_backend": requested_backend,
+            "fallback_backend": "disk",
+            "reason": str(error),
+            "how_to_fix": {
+                "prefer_disk": {
+                    "JMCP_ARTIFACT_BACKEND": "disk",
+                    "JMCP_ARTIFACT_DIR": artifact_dir,
+                },
+                "use_redis": {
+                    "note": "Ensure Redis is reachable and JMCP has python 'redis' installed.",
+                    "env": {
+                        "JMCP_ARTIFACT_BACKEND": "redis",
+                        "JMCP_REDIS_URL": "redis://<user>:<pass>@<host>:6379/0",
+                    },
+                },
+                "strict_mode": {
+                    "JMCP_ARTIFACT_FAIL_CLOSED": "true",
+                    "note": "If true, JMCP will fail instead of falling back to disk."
+                },
+            },
+        }
+
+    def _do_write() -> dict[str, Any]:
+        try:
+            ptr = store.write_json(tool_name=tool_name, payload=payload, label=label, created_at=now)
+            return ptr.as_dict()
+        except Exception as e:
+            # Self-healing: if Redis was requested but is unavailable, fall back to disk
+            # (unless strict mode is enabled). This avoids losing data when Redis is down.
+            if (not strict_backend) and requested_backend == "redis":
+                fallback_store = DiskArtifactStore(artifact_dir)
+                ptr = fallback_store.write_json(tool_name=tool_name, payload=payload, label=label, created_at=now)
+                out = ptr.as_dict()
+                out["warnings"] = [_backend_help_payload(error=e)]
+                return out
+            raise
+
+    return await anyio.to_thread.run_sync(_do_write, limiter=thread_limiter)
+
+
+def _resolve_effective_response_mode(arguments: dict | None = None) -> str:
+    """Allow per-call override of batch response mode."""
+    if arguments:
+        override = arguments.get("response_mode")
+        if isinstance(override, str):
+            override = override.strip().lower()
+            if override in {"full", "summary", "artifact"}:
+                return override
+    return _get_batch_response_mode()
+
+
+def _should_persist_to_disk(arguments: dict | None, response_mode: str) -> bool:
+    if response_mode == "artifact":
+        return True
+    if arguments and arguments.get("persist_to_disk") is True:
+        return True
+    # Backwards/forwards compatible: allow explicit Redis persistence even when response_mode != artifact.
+    if arguments and arguments.get("persist_to_redis") is True:
+        return True
+    if _truthy_env("JMCP_PERSIST_TO_DISK"):
+        return True
+    if _truthy_env("JMCP_PERSIST_TO_REDIS"):
+        return True
+    return False
+
+
+def _find_artifact_by_run_id(run_id: str, artifact_dir: str) -> str | None:
+    run_id = run_id.strip()
+    if not run_id:
+        return None
+
+    try:
+        if not os.path.isdir(artifact_dir):
+            return None
+        candidates: list[str] = []
+        for name in os.listdir(artifact_dir):
+            if run_id in name and name.endswith(".json"):
+                candidates.append(os.path.join(artifact_dir, name))
+        if not candidates:
+            return None
+        # Prefer newest (by mtime).
+        candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+        return candidates[0]
+    except Exception:
+        return None
+
+
+def _artifact_backend_fallback_warning(*, operation: str, requested_backend: str, artifact_dir: str, reason: str) -> dict[str, Any]:
+    """Compact, actionable warning payload for Redis->disk fallback paths."""
+    return {
+        "warning": "artifact_backend_fallback",
+        "operation": operation,
+        "requested_backend": requested_backend,
+        "fallback_backend": "disk",
+        "reason": reason,
+        "how_to_fix": {
+            "prefer_disk": {
+                "JMCP_ARTIFACT_BACKEND": "disk",
+                "JMCP_ARTIFACT_DIR": artifact_dir,
+            },
+            "use_redis": {
+                "note": "Ensure Redis is reachable and JMCP has python 'redis' installed.",
+                "env": {
+                    "JMCP_ARTIFACT_BACKEND": "redis",
+                    "JMCP_REDIS_URL": "redis://<user>:<pass>@<host>:6379/0",
+                },
+            },
+            "strict_mode": {
+                "JMCP_ARTIFACT_FAIL_CLOSED": "true",
+                "note": "If true, JMCP will fail instead of falling back to disk.",
+            },
+        },
+    }
+
+
+def _truncate_text(text: str, max_chars: int) -> str:
+    if max_chars <= 0:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    head = max_chars // 2
+    tail = max_chars - head
+    return text[:head] + "\n...<truncated>...\n" + text[-tail:]
+
+
+def _render_artifact_view(artifact_obj: dict[str, Any], *, mode: str, max_output_chars: int) -> dict[str, Any]:
+    """Create a small, LLM-friendly view of an artifact object."""
+    import hashlib
+    import difflib
+
+    base = {
+        "tool": artifact_obj.get("tool"),
+        "run_id": artifact_obj.get("run_id"),
+        "created_at": artifact_obj.get("created_at"),
+        "request": artifact_obj.get("request"),
+        "summary": artifact_obj.get("summary"),
+    }
+
+    if mode == "metadata":
+        return base
+
+    if mode == "summary":
+        # Include failure metadata if present.
+        for key in ("failed_routers", "slowest_routers"):
+            if key in artifact_obj:
+                base[key] = artifact_obj.get(key)
+        return base
+
+    if mode == "full":
+        return artifact_obj
+
+    if mode == "failures":
+        failures: list[dict[str, Any]] = []
+
+        # Tool: execute_junos_command_batch
+        if isinstance(artifact_obj.get("results"), list):
+            for r in artifact_obj.get("results", []):
+                status = r.get("status")
+                if status != "success":
+                    item = {
+                        "router_name": r.get("router_name"),
+                        "status": status,
+                        "execution_duration": r.get("execution_duration"),
+                        "start_time": r.get("start_time"),
+                        "end_time": r.get("end_time"),
+                    }
+                    output = r.get("output")
+                    if isinstance(output, str):
+                        item["output"] = _truncate_text(output, max_output_chars)
+                    failures.append(item)
+
+        # Tool: execute_junos_commands_batch
+        if isinstance(artifact_obj.get("routers"), list):
+            for rtr in artifact_obj.get("routers", []):
+                failed = (rtr.get("failed") or 0) > 0 or bool(rtr.get("error"))
+                if not failed:
+                    continue
+                item = {
+                    "router_name": rtr.get("router_name"),
+                    "successful": rtr.get("successful"),
+                    "failed": rtr.get("failed"),
+                    "router_duration": rtr.get("router_duration"),
+                    "error": rtr.get("error"),
+                    "failed_commands": [],
+                }
+                for cmdr in rtr.get("results", []) or []:
+                    if not cmdr.get("success"):
+                        cmd_item = {
+                            "command": cmdr.get("command"),
+                            "execution_duration": cmdr.get("execution_duration"),
+                            "start_time": cmdr.get("start_time"),
+                            "end_time": cmdr.get("end_time"),
+                            "error": cmdr.get("error"),
+                        }
+                        output = cmdr.get("output")
+                        if isinstance(output, str):
+                            cmd_item["output"] = _truncate_text(output, max_output_chars)
+                        item["failed_commands"].append(cmd_item)
+                failures.append(item)
+
+        base["failures"] = failures
+        base["failure_count"] = len(failures)
+        return base
+
+    if mode == "diff":
+        # A token-safe "what differs" view that avoids dumping full outputs.
+        # Strategy:
+        # - Group outputs by sha256 hash
+        # - Pick baseline as the largest group (prefer success)
+        # - For other groups, provide counts + router list (truncated)
+        # - Include truncated unified diffs vs baseline for a small number of variants
+
+        # Defaults (can be overridden by read_artifact wrapper by pre-populating artifact_obj['_diff_opts']).
+        diff_opts = artifact_obj.get("_diff_opts") if isinstance(artifact_obj.get("_diff_opts"), dict) else {}
+        max_routers_per_group = diff_opts.get("max_routers_per_group", 10)
+        max_diff_groups = diff_opts.get("max_diff_groups", 3)
+        max_diff_chars = diff_opts.get("max_diff_chars", 3000)
+        context_lines = diff_opts.get("context_lines", 10)
+        # If the caller doesn't explicitly set include_diffs, default to "auto":
+        # - Always include grouping (hash clusters)
+        # - Only include unified diffs when the variant is sufficiently similar to baseline
+        include_diffs = diff_opts.get("include_diffs", "auto")
+
+        # Heuristics for auto diff suppression (designed for commands like
+        # `show interfaces extensive` where counters/timestamps can cause massive rewrites).
+        auto_diff_similarity_threshold = 0.55
+        auto_diff_max_lines = 2000
+
+        if not isinstance(max_routers_per_group, int) or max_routers_per_group <= 0:
+            max_routers_per_group = 10
+        if not isinstance(max_diff_groups, int) or max_diff_groups < 0:
+            max_diff_groups = 3
+        if not isinstance(max_diff_chars, int) or max_diff_chars <= 0:
+            max_diff_chars = 3000
+        if not isinstance(context_lines, int) or context_lines < 0:
+            context_lines = 10
+        include_diffs_mode: str
+        if include_diffs is True:
+            include_diffs_mode = "force"
+        elif include_diffs is False:
+            include_diffs_mode = "off"
+        else:
+            include_diffs_mode = "auto"
+
+        def _sha256_text(text: str) -> str:
+            return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
+
+        def _limit_router_list(routers: list[str]) -> dict[str, Any]:
+            shown = routers[:max_routers_per_group]
+            omitted = max(0, len(routers) - len(shown))
+            return {
+                "routers": shown,
+                "routers_omitted": omitted,
+            }
+
+        def _unified_diff(a: str, b: str, *, a_label: str, b_label: str, compare_to_len: int) -> tuple[str, bool]:
+            a_lines = a.splitlines(keepends=False)
+            b_lines = b.splitlines(keepends=False)
+            diff_iter = difflib.unified_diff(
+                a_lines,
+                b_lines,
+                fromfile=a_label,
+                tofile=b_label,
+                n=context_lines,
+                lineterm="",
+            )
+
+            # Build the diff incrementally to avoid materializing very large diffs.
+            # We keep up to max_diff_chars for the returned text, but we also track
+            # the total diff size until it exceeds compare_to_len, so we can fall
+            # back to returning the full output when the diff is bigger than the raw.
+            chunks: list[str] = []
+            kept = 0
+            total = 0
+            kept_limit = max_diff_chars
+            exceeded = False
+            for line in diff_iter:
+                # +1 for the newline we add when joining
+                total += len(line) + 1
+                if kept < kept_limit:
+                    take = min(len(line), max(0, kept_limit - kept))
+                    chunks.append(line[:take])
+                    kept += take + 1
+                if total > compare_to_len:
+                    exceeded = True
+                    break
+
+            text = "\n".join(chunks)
+            if kept >= kept_limit:
+                text += "\n...<truncated>..."
+            return text, exceeded
+
+        def _similarity_score(a: str, b: str) -> float:
+            # Normalize digits to avoid treating per-interface counters/timestamps as rewrites.
+            import re
+
+            def _norm_lines(s: str) -> list[str]:
+                lines = s.splitlines(keepends=False)
+                if len(lines) > auto_diff_max_lines:
+                    lines = lines[:auto_diff_max_lines]
+                return [re.sub(r"\d+", "0", ln) for ln in lines]
+
+            a_norm = _norm_lines(a)
+            b_norm = _norm_lines(b)
+
+            # SequenceMatcher on normalized lines; ratio in [0, 1].
+            sm = difflib.SequenceMatcher(None, a_norm, b_norm, autojunk=True)
+            return float(sm.ratio())
+
+        def _group_single_command(results: list[dict[str, Any]]) -> dict[str, Any]:
+            groups: dict[str, dict[str, Any]] = {}
+            for r in results:
+                router = r.get("router_name")
+                status = r.get("status")
+                out = r.get("output")
+                if not isinstance(router, str):
+                    continue
+                if not isinstance(status, str):
+                    status = "unknown"
+                if not isinstance(out, str):
+                    out = ""
+                h = _sha256_text(out)
+                key = f"{status}:{h}"
+                g = groups.get(key)
+                if g is None:
+                    g = {
+                        "status": status,
+                        "sha256": h,
+                        "routers": [],
+                        "count": 0,
+                        "sample_output": out,
+                    }
+                    groups[key] = g
+                g["routers"].append(router)
+                g["count"] += 1
+
+            group_list = sorted(groups.values(), key=lambda x: (x.get("status") != "success", -(x.get("count") or 0)))
+
+            # Choose baseline: prefer success group with max count.
+            baseline = None
+            for g in group_list:
+                if g.get("status") == "success":
+                    baseline = g
+                    break
+            if baseline is None and group_list:
+                baseline = group_list[0]
+
+            baseline_out = baseline.get("sample_output") if baseline else ""
+            baseline_id = f"{baseline.get('status')}:{baseline.get('sha256')}" if baseline else "none"
+
+            variants = [g for g in group_list if g is not baseline]
+            shown_variants = variants[:max_diff_groups]
+            groups_omitted = max(0, len(variants) - len(shown_variants))
+            groups_to_show = ([baseline] if baseline is not None else []) + shown_variants
+
+            rendered_groups: list[dict[str, Any]] = []
+            diffs: list[dict[str, Any]] = []
+
+            for g in groups_to_show:
+                routers_sorted = sorted(g.get("routers") or [])
+                rendered = {
+                    "status": g.get("status"),
+                    "sha256": g.get("sha256"),
+                    "count": g.get("count"),
+                }
+                rendered.update(_limit_router_list(routers_sorted))
+                rendered_groups.append(rendered)
+
+            if include_diffs_mode != "off" and baseline is not None:
+                for g in shown_variants:
+                    other_id = f"{g.get('status')}:{g.get('sha256')}"
+                    other_out = g.get("sample_output") or ""
+                    similarity = None
+                    omitted = False
+                    reason = None
+
+                    if include_diffs_mode == "auto":
+                        similarity = _similarity_score(baseline_out, other_out)
+                        if similarity < auto_diff_similarity_threshold:
+                            omitted = True
+                            reason = "rewrite_diff_suppressed"
+
+                    entry: dict[str, Any] = {
+                        "against_baseline": baseline_id,
+                        "variant": other_id,
+                    }
+                    if similarity is not None:
+                        entry["similarity"] = round(similarity, 4)
+
+                    if omitted:
+                        entry["omitted"] = True
+                        entry["reason"] = reason
+                    else:
+                        diff_text, exceeded = _unified_diff(
+                            baseline_out,
+                            other_out,
+                            a_label=baseline_id,
+                            b_label=other_id,
+                            compare_to_len=len(other_out),
+                        )
+
+                        # If the unified diff grows larger than the raw output, return the
+                        # raw output instead. This preserves correctness while still being
+                        # token-aware (raw < diff in this case).
+                        if exceeded:
+                            entry["fallback"] = "full_output"
+                            entry["reason"] = "diff_larger_than_variant"
+                            entry["output"] = other_out
+                        else:
+                            entry["diff"] = diff_text
+                    diffs.append(entry)
+
+            return {
+                "baseline": {
+                    "id": baseline_id,
+                    "status": baseline.get("status") if baseline else None,
+                    "sha256": baseline.get("sha256") if baseline else None,
+                    "count": baseline.get("count") if baseline else 0,
+                },
+                "total_groups": len(group_list),
+                "groups_omitted": groups_omitted,
+                "groups": rendered_groups,
+                "diffs": diffs,
+            }
+
+        def _group_multi_command(routers: list[dict[str, Any]]) -> dict[str, Any]:
+            # Build per-command buckets.
+            per_cmd: dict[str, list[dict[str, Any]]] = {}
+            for rtr in routers:
+                rname = rtr.get("router_name")
+                if not isinstance(rname, str):
+                    continue
+                for cmdr in rtr.get("results") or []:
+                    cmd = cmdr.get("command")
+                    if not isinstance(cmd, str):
+                        continue
+                    out = cmdr.get("output")
+                    if not isinstance(out, str):
+                        out = ""
+                    status = "success" if cmdr.get("success") else "failed"
+                    per_cmd.setdefault(cmd, []).append({
+                        "router_name": rname,
+                        "status": status,
+                        "output": out,
+                    })
+
+            commands_sorted = sorted(per_cmd.keys())
+            rendered: list[dict[str, Any]] = []
+            for cmd in commands_sorted:
+                rendered.append({
+                    "command": cmd,
+                    "diff": _group_single_command(per_cmd[cmd]),
+                })
+            return {
+                "commands": rendered,
+            }
+
+        # Tool: execute_junos_command_batch
+        if isinstance(artifact_obj.get("results"), list):
+            base["diff"] = {
+                "type": "grouped_outputs",
+                "per_command": False,
+                "settings": {
+                    "max_routers_per_group": max_routers_per_group,
+                    "max_diff_groups": max_diff_groups,
+                    "max_diff_chars": max_diff_chars,
+                    "context_lines": context_lines,
+                    "include_diffs_mode": include_diffs_mode,
+                    "auto_diff_similarity_threshold": auto_diff_similarity_threshold,
+                    "auto_diff_max_lines": auto_diff_max_lines,
+                },
+                "result": _group_single_command(artifact_obj.get("results") or []),
+            }
+            return base
+
+        # Tool: execute_junos_commands_batch
+        if isinstance(artifact_obj.get("routers"), list):
+            base["diff"] = {
+                "type": "grouped_outputs",
+                "per_command": True,
+                "settings": {
+                    "max_routers_per_group": max_routers_per_group,
+                    "max_diff_groups": max_diff_groups,
+                    "max_diff_chars": max_diff_chars,
+                    "context_lines": context_lines,
+                    "include_diffs_mode": include_diffs_mode,
+                    "auto_diff_similarity_threshold": auto_diff_similarity_threshold,
+                    "auto_diff_max_lines": auto_diff_max_lines,
+                },
+                "result": _group_multi_command(artifact_obj.get("routers") or []),
+            }
+            return base
+
+        base["note"] = "diff mode is only supported for batch artifacts (execute_junos_command_batch / execute_junos_commands_batch)"
+        return base
+
+    # Fallback
+    base["note"] = f"Unknown mode '{mode}', returning metadata"
+    return base
+
+
+def _parse_artifact_filename(filename: str) -> dict[str, str] | None:
+    """Parse `tool-label-run_id.json` into its components.
+
+    This intentionally relies on the filename convention to avoid reading large
+    artifact JSON files just to list them.
+    """
+    if not filename.endswith(".json"):
+        return None
+
+    # Our run_id format is: YYYYmmddTHHMMSSZ-xxxxxxxx
+    # Example filename:
+    #   execute_junos_command_batch-smoke-20260127T004712Z-3b791dc1.json
+    import re
+
+    m = re.match(
+        r"^(?P<tool>[^-]+)-(?P<label>.+)-(?P<run_id>\d{8}T\d{6}Z-[0-9a-f]{8})\.json$",
+        filename,
+    )
+    if not m:
+        return None
+
+    return {
+        "tool": m.group("tool"),
+        "label": m.group("label"),
+        "run_id": m.group("run_id"),
+    }
+
+
+async def handle_list_artifacts(arguments: dict, context: Context) -> list[types.ContentBlock]:
+    """List persisted artifacts from the configured backend.
+
+    For disk, this lists files in the artifact directory. For Redis, this lists
+    indexed run_ids without reading full payloads.
+    """
+    artifact_dir = _get_artifact_dir(arguments)
+    tool_filter = arguments.get("tool")
+    label_contains = arguments.get("label_contains")
+    limit = arguments.get("limit")
+    since_ts = arguments.get("since")
+
+    if not isinstance(limit, int) or limit <= 0:
+        limit = 50
+    limit = min(limit, 500)
+
+    if isinstance(tool_filter, str):
+        tool_filter = tool_filter.strip()
+    else:
+        tool_filter = None
+
+    if isinstance(label_contains, str):
+        label_contains = label_contains.strip()
+    else:
+        label_contains = None
+
+    since_epoch: float | None = None
+    if isinstance(since_ts, str) and since_ts.strip():
+        try:
+            # Accept ISO8601; assume UTC if no tz.
+            dt = datetime.fromisoformat(since_ts.strip())
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            since_epoch = dt.timestamp()
+        except Exception:
+            since_epoch = None
+
+    backend = _get_artifact_backend(arguments)
+    store = None
+    try:
+        store = _get_artifact_store(arguments)
+    except Exception as e:
+        fallback = None
+        if backend == "redis":
+            try:
+                fallback = DiskArtifactStore(artifact_dir).list(
+                    tool=tool_filter,
+                    label_contains=label_contains,
+                    since_epoch=since_epoch,
+                    limit=limit,
+                )
+            except Exception:
+                fallback = None
+
+        if fallback is not None:
+            payload: dict[str, Any] = {
+                "backend": "disk",
+                "requested_backend": backend,
+                "artifact_dir": artifact_dir,
+                "count": len(fallback),
+                "artifacts": fallback,
+                "warnings": [_artifact_backend_fallback_warning(
+                    operation="list_artifacts",
+                    requested_backend=backend,
+                    artifact_dir=artifact_dir,
+                    reason=str(e),
+                )],
+            }
+            return [types.TextContent(type="text", text=json.dumps(payload, indent=2, ensure_ascii=False))]
+
+        payload: dict[str, Any] = {
+            "error": "artifact_store_unavailable",
+            "backend": backend,
+            "artifact_dir": artifact_dir,
+            "message": str(e),
+            "how_to_fix": {
+                "prefer_disk": {"JMCP_ARTIFACT_BACKEND": "disk", "JMCP_ARTIFACT_DIR": artifact_dir},
+                "use_redis": {"JMCP_ARTIFACT_BACKEND": "redis", "JMCP_REDIS_URL": "redis://<user>:<pass>@<host>:6379/0"},
+            },
+        }
+        return [types.TextContent(type="text", text=json.dumps(payload, indent=2, ensure_ascii=False))]
+
+    def _do_list() -> list[dict[str, Any]]:
+        return store.list(
+            tool=tool_filter,
+            label_contains=label_contains,
+            since_epoch=since_epoch,
+            limit=limit,
+        )
+
+    try:
+        artifacts = await anyio.to_thread.run_sync(_do_list, limiter=thread_limiter)
+    except Exception as e:
+        fallback = None
+        if backend == "redis":
+            try:
+                fallback = DiskArtifactStore(artifact_dir).list(
+                    tool=tool_filter,
+                    label_contains=label_contains,
+                    since_epoch=since_epoch,
+                    limit=limit,
+                )
+            except Exception:
+                fallback = None
+
+        if fallback is not None:
+            payload: dict[str, Any] = {
+                "backend": "disk",
+                "requested_backend": backend,
+                "artifact_dir": artifact_dir,
+                "count": len(fallback),
+                "artifacts": fallback,
+                "warnings": [_artifact_backend_fallback_warning(
+                    operation="list_artifacts",
+                    requested_backend=backend,
+                    artifact_dir=artifact_dir,
+                    reason=str(e),
+                )],
+            }
+            return [types.TextContent(type="text", text=json.dumps(payload, indent=2, ensure_ascii=False))]
+
+        payload: dict[str, Any] = {
+            "error": "list_failed",
+            "backend": backend,
+            "artifact_dir": artifact_dir,
+            "message": str(e),
+            "how_to_fix": {
+                "prefer_disk": {"JMCP_ARTIFACT_BACKEND": "disk", "JMCP_ARTIFACT_DIR": artifact_dir},
+                "use_redis": {"JMCP_ARTIFACT_BACKEND": "redis", "JMCP_REDIS_URL": "redis://<user>:<pass>@<host>:6379/0"},
+            },
+        }
+        return [types.TextContent(type="text", text=json.dumps(payload, indent=2, ensure_ascii=False))]
+
+    return [types.TextContent(
+        type="text",
+        text=json.dumps({
+            "backend": backend,
+            "artifact_dir": artifact_dir,
+            "count": len(artifacts),
+            "artifacts": artifacts,
+        }, indent=2, ensure_ascii=False),
+    )]
+
+
+async def handle_get_server_settings(arguments: dict, context: Context) -> list[types.ContentBlock]:
+    """Return current JMCP server settings (helpful for operators)."""
+    global MAX_WORKERS, thread_limiter, default_workers, WORKERS_PER_CORE
+
+    limiter_tokens = None
+    limiter_borrowed = None
+    try:
+        if thread_limiter is not None:
+            limiter_tokens = getattr(thread_limiter, "total_tokens", None)
+            limiter_borrowed = getattr(thread_limiter, "borrowed_tokens", None)
+    except Exception:
+        pass
+
+    settings: dict[str, Any] = {
+        "workers": {
+            "default_workers": default_workers,
+            "workers_per_core": WORKERS_PER_CORE,
+            "effective_workers": MAX_WORKERS,
+            "limiter": {
+                "enabled": thread_limiter is not None,
+                "total_tokens": limiter_tokens,
+                "borrowed_tokens": limiter_borrowed,
+            },
+        },
+        "batch_response": {
+            "default_mode": _get_batch_response_mode(),
+            "env_default": os.getenv("JMCP_BATCH_RESPONSE_MODE"),
+            "file_override_path": os.path.join(os.path.dirname(__file__), ".jmcp_batch_response_mode"),
+        },
+        "artifacts": {
+            "default_dir": _get_artifact_dir({}),
+            "env_dir": os.getenv("JMCP_ARTIFACT_DIR"),
+            "backend": _get_artifact_backend({}),
+            "env_backend": os.getenv("JMCP_ARTIFACT_BACKEND"),
+            "persist_env_disk": os.getenv("JMCP_PERSIST_TO_DISK"),
+            "persist_env_redis": os.getenv("JMCP_PERSIST_TO_REDIS"),
+            "redis": {
+                "url_configured": bool(_get_redis_url()),
+                "host": _get_redis_host(),
+                "port": _get_redis_port(),
+                "db": _get_redis_db(),
+                "username_configured": bool(_get_redis_username()),
+                "password_configured": bool(_get_redis_password()),
+                "prefix": _get_redis_prefix(),
+                "ttl_seconds": _get_redis_ttl_seconds(),
+                "gzip_enabled": _get_artifact_gzip_enabled(),
+                "max_bytes": _get_redis_max_bytes(),
+                "reserve_bytes": _get_redis_reserve_bytes(),
+            },
+            "dir_override_path": os.path.join(os.path.dirname(__file__), ".jmcp_artifact_dir"),
+            "backend_override_path": os.path.join(os.path.dirname(__file__), ".jmcp_artifact_backend"),
+        },
+        "process": {
+            "pid": os.getpid(),
+            "cwd": os.getcwd(),
+            "jmcp_py": os.path.abspath(__file__),
+        },
+    }
+
+    try:
+        settings["connection_pool"] = {
+            "enabled": bool(connection_pool and getattr(connection_pool, "enabled", False)),
+        }
+    except Exception:
+        pass
+
+    return [types.TextContent(type="text", text=json.dumps(settings, indent=2, ensure_ascii=False))]
+
+
+def _normalize_cli_output(output: Any) -> str:
+    if output is None:
+        return ""
+
+    if isinstance(output, str):
+        return output
+
+    if isinstance(output, (dict, list)):
+        try:
+            return json.dumps(output, indent=2, ensure_ascii=False)
+        except Exception:
+            return str(output)
+
+    if isinstance(output, bytes):
+        try:
+            return output.decode("utf-8", errors="replace")
+        except Exception:
+            return str(output)
+
+    # PyEZ may return an lxml element for XML format; avoid hard dependency.
+    try:
+        tag = getattr(output, "tag", None)
+        if tag is not None:
+            try:
+                from lxml import etree  # type: ignore
+
+                return etree.tostring(output, pretty_print=True, encoding="unicode")
+            except Exception:
+                return str(output)
+    except Exception:
+        pass
+
+    return str(output)
+
+
+async def _run_cli_command(router_name: str, command: str, timeout: int = 360, cli_format: str | None = None) -> str:
+    """Legacy CLI runner returning only the output string.
+
+    Newer code should prefer `_run_cli_command_with_meta` to enable automatic
+    transport/timeout healing and to expose retry statistics.
+    """
+    meta = await _run_cli_command_with_meta(
+        router_name,
+        command,
+        timeout,
+        cli_format=cli_format,
+    )
+    return str(meta.get("output") or "")
+
+
+def _default_auto_fallback_to_fresh_for_command(command: str) -> bool:
+    # Default: enable for read-only show commands.
+    cmd = (command or "").lstrip().lower()
+    if not cmd:
+        return False
+    if cmd.startswith("show "):
+        # Allow operator override.
+        if os.getenv("JMCP_AUTO_FALLBACK_TO_FRESH") is not None:
+            return _truthy_env("JMCP_AUTO_FALLBACK_TO_FRESH")
+        return True
+    return False
+
+
+async def _run_cli_command_with_meta(
+    router_name: str,
+    command: str,
+    timeout: int = 360,
+    cli_format: str | None = None,
+    *,
+    connection_mode: str | None = None,
+    auto_fallback_to_fresh: bool | None = None,
+) -> dict[str, Any]:
+    """Run CLI with pooling + optional healing.
+
+    Strategy:
+      - If connection_mode == "fresh": always open/run/close.
+      - Else try pooled first (when available).
+      - If pooled fails with transport/timeout: invalidate + retry once using fresh session
+        (only when auto_fallback_to_fresh is enabled).
+    """
+    if router_name not in devices:
+        out = f"Router {router_name} not found in the device mapping."
+        cat, hint = _classify_failure_text(out)
+        return {
+            "output": out,
+            "failure_category": cat,
+            "failure_hint": hint,
+            "connection_mode_used": "none",
+            "attempts": 1,
+            "fresh_fallback_attempted": False,
+            "fresh_fallback_succeeded": False,
+        }
+
+    device_info = devices[router_name]
+    try:
+        connect_params = prepare_connection_params(device_info, router_name)
+    except ValueError as ve:
+        out = f"Error: {ve}"
+        cat, hint = _classify_failure_text(out)
+        return {
+            "output": out,
+            "failure_category": cat,
+            "failure_hint": hint,
+            "connection_mode_used": "none",
+            "attempts": 1,
+            "fresh_fallback_attempted": False,
+            "fresh_fallback_succeeded": False,
+        }
+
+    cli_format_normalized: str | None
+    if isinstance(cli_format, str):
+        cli_format_normalized = cli_format.strip().lower()
+    else:
+        cli_format_normalized = None
+
+    if cli_format_normalized in {"", "text", "plain"}:
+        cli_format_normalized = None
+
+    if cli_format_normalized not in {None, "json", "xml"}:
+        cli_format_normalized = None
+
+    mode = (connection_mode or "pooled").strip().lower() if isinstance(connection_mode, str) else "pooled"
+    if mode not in {"pooled", "fresh"}:
+        mode = "pooled"
+
+    if auto_fallback_to_fresh is None:
+        auto_fallback = _default_auto_fallback_to_fresh_for_command(command)
+    else:
+        auto_fallback = bool(auto_fallback_to_fresh)
+
+    def _direct_cli() -> Any:
+        with Device(**connect_params) as junos_device:
+            junos_device.timeout = timeout
+            if cli_format_normalized is None:
+                return junos_device.cli(command, warning=False)
+            return junos_device.cli(command, warning=False, format=cli_format_normalized)
+
+    async def _run_fresh() -> dict[str, Any]:
+        try:
+            raw = await anyio.to_thread.run_sync(_direct_cli, limiter=thread_limiter)
+            out = _normalize_cli_output(raw)
+            return {
+                "output": out,
+                "failure_category": "success",
+                "failure_hint": None,
+                "connection_mode_used": "fresh",
+            }
+        except ConnectError as ce:
+            out = f"Connection error to {router_name}: {ce}"
+            cat, hint = _classify_failure_text(out)
+            return {
+                "output": out,
+                "failure_category": cat,
+                "failure_hint": hint,
+                "connection_mode_used": "fresh",
+            }
+        except Exception as e:
+            out = f"An error occurred: {e}"
+            cat, hint = _classify_failure_text(out)
+            return {
+                "output": out,
+                "failure_category": cat if cat != "success" else "other",
+                "failure_hint": hint,
+                "connection_mode_used": "fresh",
+            }
+
+    # Forced fresh mode.
+    if mode == "fresh":
+        res = await _run_fresh()
+        res.update({
+            "attempts": 1,
+            "fresh_fallback_attempted": False,
+            "fresh_fallback_succeeded": False,
+        })
+        return res
+
+    # Pooled first when available.
+    pool = connection_pool
+    if pool is not None and pool.enabled:
+        device = await pool.get_connection(router_name)
+        try:
+            def _do_cli() -> Any:
+                device.timeout = timeout
+                if cli_format_normalized is None:
+                    return device.cli(command, warning=False)
+                return device.cli(command, warning=False, format=cli_format_normalized)
+
+            raw = await anyio.to_thread.run_sync(_do_cli, limiter=thread_limiter)
+            out = _normalize_cli_output(raw)
+            return {
+                "output": out,
+                "failure_category": "success",
+                "failure_hint": None,
+                "connection_mode_used": "pooled",
+                "attempts": 1,
+                "fresh_fallback_attempted": False,
+                "fresh_fallback_succeeded": False,
+            }
+        except ConnectError as ce:
+            out = f"Connection error to {router_name}: {ce}"
+            cat, hint = _classify_failure_text(out)
+            with suppress(Exception):
+                await pool.invalidate_connection(router_name)
+            pooled_cat = cat if cat != "success" else "transport"
+            pooled_hint = hint or out[:160]
+        except Exception as e:
+            # Try to map generic exceptions into buckets.
+            msg = str(e)
+            cat, hint = _classify_failure_text(msg)
+            out = f"An error occurred: {e}"
+            with suppress(Exception):
+                await pool.invalidate_connection(router_name)
+            pooled_cat = cat if cat != "success" else "other"
+            pooled_hint = hint or msg[:160] if msg else None
+        finally:
+            with suppress(Exception):
+                await pool.release_connection(router_name)
+
+        # Optional healing: on transport/timeout, retry once using fresh session.
+        if auto_fallback and pooled_cat in {"transport", "timeout"}:
+            fresh = await _run_fresh()
+            ok = fresh.get("failure_category") == "success"
+            fresh.update({
+                "attempts": 2,
+                "fresh_fallback_attempted": True,
+                "fresh_fallback_succeeded": bool(ok),
+                "pooled_failure_category": pooled_cat,
+                "pooled_failure_hint": pooled_hint,
+            })
+            return fresh
+
+        return {
+            "output": out,
+            "failure_category": pooled_cat,
+            "failure_hint": pooled_hint,
+            "connection_mode_used": "pooled",
+            "attempts": 1,
+            "fresh_fallback_attempted": False,
+            "fresh_fallback_succeeded": False,
+        }
+
+    # Pool disabled: behave like fresh.
+    res = await _run_fresh()
+    res.update({
+        "attempts": 1,
+        "fresh_fallback_attempted": False,
+        "fresh_fallback_succeeded": False,
+    })
+    return res
+
+
+def _looks_like_cli_error(output: Any) -> bool:
+    """Best-effort detection of error strings returned by _run_cli_command.
+
+    We intentionally keep this conservative and aligned with existing behavior in
+    `handle_execute_junos_command_batch`, which already treats certain prefixes
+    as failures.
+    """
+    if not isinstance(output, str):
+        return True
+
+    text = output.lstrip()
+    if not text:
+        return False
+
+    if text.startswith(("Connection error", "An error occurred", "Error:", "Exception during execution")):
+        return True
+
+    # Common internal message when the requested router name isn't configured.
+    if "not found in the device mapping" in text:
+        return True
+
+    return False
+
+
+FailureCategory = Literal[
+    "success",
+    "preconnect_failed",
+    "auth",
+    "transport",
+    "timeout",
+    "cli",
+    "other",
+]
+
+
+def _classify_failure_text(text: str) -> tuple[FailureCategory, str | None]:
+    """Best-effort classification of failures from text.
+
+    This is intentionally heuristic because many error paths are already
+    string-based (e.g. _run_cli_command returns human-readable messages).
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return "success", None
+
+    low = raw.lower()
+
+    # Barrier skip marker (produced by barrier_sync proceed-mode).
+    if "preconnect_failed (skipped execution)" in low or low.startswith("preconnect_failed"):
+        return "preconnect_failed", raw.splitlines()[0][:160]
+
+    auth_keywords = (
+        "authentication failed",
+        "auth fail",
+        "permission denied",
+        "publickey",
+        "login incorrect",
+        "invalid password",
+        "not authorized",
+        "access denied",
+        "too many authentication failures",
+    )
+    timeout_keywords = (
+        "timed out",
+        "timeout",
+        "operation timed out",
+    )
+    transport_keywords = (
+        "connection reset",
+        "connection refused",
+        "broken pipe",
+        "no route to host",
+        "network is unreachable",
+        "connection aborted",
+        "connection closed",
+        "eof",
+        "socket is closed",
+        "connection unexpectedly closed",
+    )
+    cli_keywords = (
+        "unknown command",
+        "syntax error",
+        "invalid",
+        "ambiguous",
+        "not a valid command",
+        "permission denied",
+    )
+
+    # Auth before CLI because many platforms use "permission denied" for authz.
+    if any(k in low for k in auth_keywords):
+        return "auth", raw.splitlines()[0][:160]
+
+    if any(k in low for k in timeout_keywords):
+        return "timeout", raw.splitlines()[0][:160]
+
+    if any(k in low for k in transport_keywords):
+        return "transport", raw.splitlines()[0][:160]
+
+    # CLI errors are often returned as text even when transport is healthy.
+    if any(k in low for k in cli_keywords):
+        return "cli", raw.splitlines()[0][:160]
+
+    # Known prefixes from _run_cli_command.
+    if low.startswith("connection error"):
+        return "transport", raw.splitlines()[0][:160]
+    if low.startswith("an error occurred") or low.startswith("error:"):
+        return "other", raw.splitlines()[0][:160]
+    if "not found in the device mapping" in low:
+        return "other", raw.splitlines()[0][:160]
+
+    return "success", None
+
+
+def _rollup_router_failure_category(router_obj: dict[str, Any]) -> tuple[FailureCategory, str | None]:
+    """Derive a per-router failure category from a multi-command router object."""
+    # Router-level error (e.g. preconnect skip or gather exception)
+    err = router_obj.get("error")
+    if isinstance(err, str) and err.strip():
+        return _classify_failure_text(err)
+
+    # Command-level failures
+    results = router_obj.get("results")
+    if not isinstance(results, list):
+        return "success", None
+
+    categories: list[FailureCategory] = []
+    hints: list[str] = []
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        cat = item.get("failure_category")
+        hint = item.get("failure_hint")
+        if isinstance(cat, str):
+            categories.append(cat)  # type: ignore[arg-type]
+        if isinstance(hint, str) and hint.strip():
+            hints.append(hint.strip())
+
+    if not categories:
+        return "success", None
+
+    # Priority: auth > transport > timeout > cli > other > preconnect_failed > success
+    priority: dict[FailureCategory, int] = {
+        "auth": 60,
+        "transport": 50,
+        "timeout": 40,
+        "cli": 30,
+        "other": 20,
+        "preconnect_failed": 10,
+        "success": 0,
+    }
+    worst = max(categories, key=lambda c: priority.get(c, 0))
+    return worst, (hints[0][:160] if hints else None)
 
 
 class Context(BaseModel, Generic[ServerSessionT, LifespanContextT, RequestT]):
@@ -617,6 +2134,27 @@ def get_timeout_with_fallback(arguments_timeout: int = None) -> int:
 
     return 360
 
+def get_stateless_with_fallback(default: bool = False) -> bool:
+    """Get stateless mode from JMCP_STATELESS environment variable with safe fallback."""
+    env_stateless = os.getenv('JMCP_STATELESS')
+    if env_stateless is None:
+        return default
+
+    normalized_value = env_stateless.strip().lower()
+    truthy_values = {'1', 'true', 'yes', 'y', 'on'}
+    falsy_values = {'0', 'false', 'no', 'n', 'off'}
+
+    if normalized_value in truthy_values:
+        return True
+    if normalized_value in falsy_values:
+        return False
+
+    log.warning(
+        f"Invalid JMCP_STATELESS environment variable value: {env_stateless}. "
+        f"Using default stateless={default}."
+    )
+    return default
+
 def validate_token_from_file(token: str) -> bool:
     """Validate if a token exists in the .tokens file"""
     try:
@@ -691,13 +2229,11 @@ async def handle_execute_junos_command(arguments: dict, context: Context) -> lis
     start_timestamp = datetime.now(timezone.utc).isoformat()
     router_name = arguments.get("router_name", "")
     command = arguments.get("command", "")
+    cli_format = arguments.get("format")
     timeout = get_timeout_with_fallback(arguments.get("timeout"))
 
-    if router_name not in devices:
-        result = f"Router {router_name} not found in the device mapping."
-    else:
-        log.debug(f"Executing command {command} on router {router_name} with timeout {timeout}s")
-        result = _run_junos_cli_command(router_name, command, timeout)
+    log.debug(f"Executing command {command} on router {router_name} with timeout {timeout}s")
+    result = await _run_cli_command(router_name, command, timeout, cli_format=cli_format)
 
     end_time = time.time()
     end_timestamp = datetime.now(timezone.utc).isoformat()
@@ -707,6 +2243,7 @@ async def handle_execute_junos_command(arguments: dict, context: Context) -> lis
         text=result,
         annotations={"router_name": router_name,
                      "command": command,
+                     "format": cli_format,
                      "metadata": {
                         "execution_duration": execution_duration,
                         "start_time": start_timestamp,
@@ -741,7 +2278,45 @@ async def handle_execute_junos_command_batch(arguments: dict, context: Context) 
     batch_start_time = time.time()
     router_names = arguments.get("router_names", [])
     command = arguments.get("command", "")
+    cli_format = arguments.get("format")
     timeout = get_timeout_with_fallback(arguments.get("timeout"))
+
+    connection_mode = arguments.get("connection_mode")
+    if isinstance(connection_mode, str):
+        connection_mode = connection_mode.strip().lower()
+    if connection_mode not in {"pooled", "fresh"}:
+        connection_mode = "pooled"
+
+    auto_fallback_to_fresh = arguments.get("auto_fallback_to_fresh")
+    if auto_fallback_to_fresh is not None:
+        auto_fallback_to_fresh = bool(auto_fallback_to_fresh)
+
+    barrier_sync = bool(arguments.get("barrier_sync"))
+    barrier_policy = arguments.get("barrier_policy") or "proceed"
+    if isinstance(barrier_policy, str):
+        barrier_policy = barrier_policy.strip().lower()
+    if barrier_policy not in {"proceed", "strict"}:
+        barrier_policy = "proceed"
+
+    preconnect_timeout_raw = arguments.get("preconnect_timeout")
+    if isinstance(preconnect_timeout_raw, int) and preconnect_timeout_raw > 0:
+        preconnect_timeout = preconnect_timeout_raw
+    else:
+        preconnect_timeout = 30
+
+    preconnect_retries_raw = arguments.get("preconnect_retries")
+    if isinstance(preconnect_retries_raw, int) and preconnect_retries_raw >= 0:
+        preconnect_retries = min(preconnect_retries_raw, 10)
+    else:
+        preconnect_retries = 2
+
+    preconnect_backoff_raw = arguments.get("preconnect_backoff_seconds")
+    if isinstance(preconnect_backoff_raw, int) and preconnect_backoff_raw >= 0:
+        preconnect_backoff_seconds = min(preconnect_backoff_raw, 60)
+    else:
+        preconnect_backoff_seconds = 1
+
+    # Concurrency is set once at server startup.
 
     # ============================================================================
     # STEP 1: Input Validation
@@ -769,8 +2344,186 @@ async def handle_execute_junos_command_batch(arguments: dict, context: Context) 
             text=f"Error: The following routers not found in device mapping: {', '.join(invalid_routers)}"
         )]
 
-    log.info(f"Executing batch command on {len(router_names)} routers in parallel: {command}")
+    log.info(
+        f"Executing batch command on {len(router_names)} routers in parallel: {command} "
+        f"(barrier_sync={barrier_sync}, policy={barrier_policy}, preconnect_timeout={preconnect_timeout}s, "
+        f"preconnect_retries={preconnect_retries})"
+    )
     await context.info(f"Executing command on {len(router_names)} routers in parallel...")
+
+    # Optional barrier sync: preconnect to all routers first, then execute command only on ready routers.
+    preconnect_info: dict[str, Any] | None = None
+    routers_to_execute = list(router_names)
+    preconnect_failed_map: dict[str, str] = {}
+
+    if barrier_sync:
+        pool = connection_pool
+
+        async def _preconnect_one(router_name: str) -> dict[str, Any]:
+            started = time.time()
+            last_error: str | None = None
+
+            for attempt in range(preconnect_retries + 1):
+                device = None
+                try:
+                    if connection_mode != "fresh" and pool is not None and pool.enabled:
+                        with anyio.fail_after(preconnect_timeout):
+                            device = await pool.get_connection(router_name)
+                    else:
+                        device_info = devices[router_name]
+                        connect_params = prepare_connection_params(device_info, router_name)
+
+                        def _open_and_close() -> None:
+                            with Device(**connect_params) as dev:
+                                dev.timeout = preconnect_timeout
+
+                        with anyio.fail_after(preconnect_timeout):
+                            await anyio.to_thread.run_sync(_open_and_close, limiter=thread_limiter)
+
+                    duration = round(time.time() - started, 3)
+                    return {
+                        "router_name": router_name,
+                        "status": "connected",
+                        "attempts": attempt + 1,
+                        "duration": duration,
+                    }
+                except Exception as e:
+                    last_error = str(e)
+                    if pool is not None and pool.enabled:
+                        with suppress(Exception):
+                            await pool.invalidate_connection(router_name)
+                    if attempt == preconnect_retries:
+                        duration = round(time.time() - started, 3)
+                        return {
+                            "router_name": router_name,
+                            "status": "failed",
+                            "attempts": attempt + 1,
+                            "duration": duration,
+                            "error": last_error,
+                        }
+                    if preconnect_backoff_seconds:
+                        await asyncio.sleep(preconnect_backoff_seconds)
+                finally:
+                    if device is not None and pool is not None and pool.enabled:
+                        with suppress(Exception):
+                            await pool.release_connection(router_name)
+
+            duration = round(time.time() - started, 3)
+            return {
+                "router_name": router_name,
+                "status": "failed",
+                "attempts": preconnect_retries + 1,
+                "duration": duration,
+                "error": last_error or "unknown preconnect failure",
+            }
+
+        preconnect_start = time.time()
+        preconnect_results = await asyncio.gather(
+            *[_preconnect_one(r) for r in router_names],
+            return_exceptions=False,
+        )
+        preconnect_duration = round(time.time() - preconnect_start, 3)
+
+        ready = [r["router_name"] for r in preconnect_results if r.get("status") == "connected"]
+        failed = [r for r in preconnect_results if r.get("status") != "connected"]
+        preconnect_failed_map = {
+            r.get("router_name"): (r.get("error") or "preconnect failed")
+            for r in failed
+            if r.get("router_name")
+        }
+
+        preconnect_info = {
+            "enabled": True,
+            "policy": barrier_policy,
+            "timeout": preconnect_timeout,
+            "retries": preconnect_retries,
+            "backoff_seconds": preconnect_backoff_seconds,
+            "duration": preconnect_duration,
+            "ready_count": len(ready),
+            "failed_count": len(failed),
+            "failed_routers": failed,
+        }
+
+        response_mode = _resolve_effective_response_mode(arguments)
+
+        if barrier_policy == "strict" and preconnect_failed_map:
+            batch_end_time = time.time()
+            batch_duration = round(batch_end_time - batch_start_time, 3)
+
+            # In strict mode we execute nothing; some routers failed preconnect,
+            # and the rest are blocked by policy.
+            strict_not_executed = len(router_names) - len(preconnect_failed_map)
+            strict_breakdown: dict[str, int] = {
+                "preconnect_failed": len(preconnect_failed_map),
+                "auth": 0,
+                "transport": 0,
+                "timeout": 0,
+                "cli": 0,
+                "other": strict_not_executed,
+            }
+
+            response_data: dict[str, Any] = {
+                "error": "preconnect_failed",
+                "message": "Barrier preconnect failed for one or more routers; strict policy prevents execution.",
+                "preconnect": preconnect_info,
+                "summary": {
+                    "command": command,
+                    "total_routers": len(router_names),
+                    "total_routers_executed": 0,
+                    "total_routers_preconnect_failed": len(preconnect_failed_map),
+                    "successful": 0,
+                    "failed": len(router_names),
+                    "not_executed_due_to_strict_policy": strict_not_executed,
+                    "failure_breakdown": strict_breakdown,
+                    "connection": {
+                        "connection_mode": connection_mode,
+                        "auto_fallback_to_fresh": auto_fallback_to_fresh,
+                    },
+                    "retry_stats": {
+                        "routers_used_pooled": 0,
+                        "routers_used_fresh": 0,
+                        "routers_with_fresh_fallback_attempted": 0,
+                        "routers_with_fresh_fallback_succeeded": 0,
+                        "routers_with_fresh_fallback_failed": 0,
+                    },
+                    "total_duration": batch_duration,
+                },
+            }
+
+            if _should_persist_to_disk(arguments, response_mode):
+                try:
+                    artifact = await _persist_json_artifact(
+                        tool_name="execute_junos_command_batch",
+                        arguments=arguments,
+                        payload={
+                            "request": {
+                                "router_names": router_names,
+                                "command": command,
+                                "timeout": timeout,
+                                "connection_mode": connection_mode,
+                                "auto_fallback_to_fresh": auto_fallback_to_fresh,
+                                "barrier_sync": True,
+                                "barrier_policy": barrier_policy,
+                                "preconnect_timeout": preconnect_timeout,
+                                "preconnect_retries": preconnect_retries,
+                                "preconnect_backoff_seconds": preconnect_backoff_seconds,
+                            },
+                            "preconnect": preconnect_info,
+                            "summary": response_data.get("summary", {}),
+                            "results": [],
+                        },
+                    )
+                    response_data["artifact"] = artifact
+                except Exception as e:
+                    log.warning(f"Failed to persist batch artifact: {e}")
+
+            if response_mode == "artifact":
+                response_data.pop("results", None)
+
+            formatted_output = json.dumps(response_data, indent=2)
+            return [types.TextContent(type="text", text=formatted_output)]
+
+        routers_to_execute = ready
 
     # ============================================================================
     # STEP 2: Define Per-Router Async Function
@@ -790,6 +2543,9 @@ async def handle_execute_junos_command_batch(arguments: dict, context: Context) 
         """
         start_time = time.time()
         start_timestamp = datetime.now(timezone.utc).isoformat()
+        meta: dict[str, Any] | None = None
+        failure_category: str | None = None
+        failure_hint: str | None = None
 
         try:
             # ----------------------------------------------------------------
@@ -813,36 +2569,62 @@ async def handle_execute_junos_command_batch(arguments: dict, context: Context) 
             # Think of it like: Each router gets its own phone line (thread),
             # and all phone calls happen at the same time instead of one after another.
 
-            result = await anyio.to_thread.run_sync(
-                _run_junos_cli_command,  # The synchronous function to run
-                router_name,              # Arguments to pass to it
+            meta = await _run_cli_command_with_meta(
+                router_name,
                 command,
-                timeout
+                timeout,
+                cli_format=cli_format,
+                connection_mode=connection_mode,
+                auto_fallback_to_fresh=auto_fallback_to_fresh,
             )
 
-            # Determine if this was a success or error based on result content
-            # (the _run_junos_cli_command returns error messages as strings)
-            is_error = result.startswith("Connection error") or result.startswith("An error occurred") or result.startswith("Error:")
-            status = "failed" if is_error else "success"
+            result = str(meta.get("output") or "")
+            failure_category = meta.get("failure_category")
+            failure_hint = meta.get("failure_hint")
+            status = "success" if failure_category == "success" else "failed"
 
         except Exception as e:
             # Catch any unexpected exceptions (shouldn't happen normally)
             result = f"Exception during execution: {str(e)}"
             status = "failed"
+            failure_category, failure_hint = _classify_failure_text(result)
+            if failure_category == "success":
+                failure_category = "other"
 
         end_time = time.time()
         end_timestamp = datetime.now(timezone.utc).isoformat()
         execution_duration = round(end_time - start_time, 3)
 
         # Return structured data for this single router
-        return {
+        payload: dict[str, Any] = {
             "router_name": router_name,
             "status": status,
             "output": result,
+            "format": cli_format,
             "execution_duration": execution_duration,
             "start_time": start_timestamp,
             "end_time": end_timestamp
         }
+
+        if isinstance(meta, dict):
+            payload.update({
+                "connection_mode_used": meta.get("connection_mode_used"),
+                "attempts": meta.get("attempts"),
+                "fresh_fallback_attempted": meta.get("fresh_fallback_attempted"),
+                "fresh_fallback_succeeded": meta.get("fresh_fallback_succeeded"),
+            })
+            if meta.get("fresh_fallback_attempted"):
+                if meta.get("pooled_failure_category"):
+                    payload["pooled_failure_category"] = meta.get("pooled_failure_category")
+                if meta.get("pooled_failure_hint"):
+                    payload["pooled_failure_hint"] = meta.get("pooled_failure_hint")
+
+        if status != "success":
+            payload["failure_category"] = failure_category or "other"
+            if failure_hint:
+                payload["failure_hint"] = failure_hint
+
+        return payload
 
     # ============================================================================
     # STEP 3: Launch All Tasks in Parallel with asyncio.gather()
@@ -883,9 +2665,23 @@ async def handle_execute_junos_command_batch(arguments: dict, context: Context) 
     # it takes for the slowest one to finish!
 
     results = await asyncio.gather(
-        *[execute_on_router(router_name) for router_name in router_names],
+        *[execute_on_router(router_name) for router_name in routers_to_execute],
         return_exceptions=False  # If any task raises an exception, propagate it immediately
     )
+
+    if barrier_sync and preconnect_failed_map:
+        now_ts = datetime.now(timezone.utc).isoformat()
+        for skipped_router, err in preconnect_failed_map.items():
+            results.append({
+                "router_name": skipped_router,
+                "status": "failed",
+                "output": f"preconnect_failed (skipped execution): {err}",
+                "failure_category": "preconnect_failed",
+                "failure_hint": str(err)[:160] if err else "preconnect_failed",
+                "execution_duration": 0,
+                "start_time": now_ts,
+                "end_time": now_ts,
+            })
 
     batch_end_time = time.time()
     batch_duration = round(batch_end_time - batch_start_time, 3)
@@ -899,17 +2695,111 @@ async def handle_execute_junos_command_batch(arguments: dict, context: Context) 
     successful_count = sum(1 for r in results if r["status"] == "success")
     failed_count = len(results) - successful_count
 
-    # Build structured response with summary + individual results
-    response_data = {
+    response_mode = _resolve_effective_response_mode(arguments)
+
+    # Build structured response with summary + (optional) individual results
+    response_data: dict[str, Any] = {
+        "preconnect": preconnect_info,
         "summary": {
             "command": command,
             "total_routers": len(router_names),
+            "total_routers_executed": len(routers_to_execute),
+            "total_routers_preconnect_failed": len(preconnect_failed_map) if barrier_sync else 0,
             "successful": successful_count,
             "failed": failed_count,
-            "total_duration": batch_duration
+            "total_duration": batch_duration,
         },
-        "results": results  # This contains all per-router results in order
     }
+
+    response_data["summary"]["connection"] = {
+        "connection_mode": connection_mode,
+        "auto_fallback_to_fresh": auto_fallback_to_fresh,
+    }
+
+    # Failure breakdown by router (token-safe, operator-friendly)
+    breakdown: dict[str, int] = {"preconnect_failed": 0, "auth": 0, "transport": 0, "timeout": 0, "cli": 0, "other": 0}
+    for r in results:
+        if r.get("status") == "success":
+            continue
+        cat = r.get("failure_category")
+        if not isinstance(cat, str) or not cat:
+            out = r.get("output")
+            cat, _ = _classify_failure_text(out if isinstance(out, str) else "")
+        if cat == "success":
+            cat = "other"
+        if cat not in breakdown:
+            cat = "other"
+        breakdown[cat] += 1
+
+    response_data["summary"]["failure_breakdown"] = breakdown
+
+    # Retry/healing statistics (router-level)
+    used_pooled = sum(1 for r in results if r.get("connection_mode_used") == "pooled")
+    used_fresh = sum(1 for r in results if r.get("connection_mode_used") == "fresh")
+    fallback_attempted = sum(1 for r in results if r.get("fresh_fallback_attempted") is True)
+    fallback_succeeded = sum(1 for r in results if r.get("fresh_fallback_succeeded") is True)
+    response_data["summary"]["retry_stats"] = {
+        "routers_used_pooled": used_pooled,
+        "routers_used_fresh": used_fresh,
+        "routers_with_fresh_fallback_attempted": fallback_attempted,
+        "routers_with_fresh_fallback_succeeded": fallback_succeeded,
+        "routers_with_fresh_fallback_failed": max(0, fallback_attempted - fallback_succeeded),
+    }
+
+    if response_mode in {"summary", "artifact"}:
+        # Keep payload small: include only minimal per-router metadata.
+        router_summaries = [
+            {
+                "router_name": r.get("router_name"),
+                "status": r.get("status"),
+                "execution_duration": r.get("execution_duration"),
+                "failure_category": r.get("failure_category"),
+                "failure_hint": r.get("failure_hint"),
+                "connection_mode_used": r.get("connection_mode_used"),
+                "attempts": r.get("attempts"),
+                "fresh_fallback_attempted": r.get("fresh_fallback_attempted"),
+                "fresh_fallback_succeeded": r.get("fresh_fallback_succeeded"),
+            }
+            for r in results
+        ]
+        # Include only failing routers to keep noise down.
+        failed_routers = [r for r in router_summaries if r.get("status") != "success"]
+        response_data["failed_routers"] = failed_routers
+    else:
+        response_data["results"] = results  # Full per-router output
+
+    # Optionally persist full results (even if we're returning only a summary).
+    if _should_persist_to_disk(arguments, response_mode):
+        try:
+            artifact = await _persist_json_artifact(
+                tool_name="execute_junos_command_batch",
+                arguments=arguments,
+                payload={
+                    "request": {
+                        "router_names": router_names,
+                        "command": command,
+                        "timeout": timeout,
+                        "connection_mode": connection_mode,
+                        "auto_fallback_to_fresh": auto_fallback_to_fresh,
+                        "barrier_sync": barrier_sync,
+                        "barrier_policy": barrier_policy,
+                        "preconnect_timeout": preconnect_timeout,
+                        "preconnect_retries": preconnect_retries,
+                        "preconnect_backoff_seconds": preconnect_backoff_seconds,
+                    },
+                    "preconnect": preconnect_info,
+                    "summary": response_data.get("summary", {}),
+                    "results": results,
+                },
+            )
+            response_data["artifact"] = artifact
+        except Exception as e:
+            # Never fail the tool just because persistence failed.
+            log.warning(f"Failed to persist batch artifact: {e}")
+
+    # In artifact mode, never include large raw outputs in the tool response.
+    if response_mode == "artifact":
+        response_data.pop("results", None)
 
     # Format as pretty JSON for LLM consumption
     # The LLM can easily parse this and identify which output came from which router
@@ -941,11 +2831,11 @@ async def handle_get_junos_config(arguments: dict, context: Context) -> list[typ
     """Handler for get_junos_config tool"""
     router_name = arguments.get("router_name", "")
     
-    if router_name not in devices:
-        result = f"Router {router_name} not found in the device mapping."
-    else:
-        log.debug(f"Getting configuration from router {router_name}")
-        result = _run_junos_cli_command(router_name, "show configuration | display inheritance no-comments | display set | no-more")
+    log.debug(f"Getting configuration from router {router_name}")
+    result = await _run_cli_command(
+        router_name,
+        "show configuration | display inheritance no-comments | display set | no-more"
+    )
     
     content_block = types.TextContent(
         type="text",
@@ -962,11 +2852,8 @@ async def handle_junos_config_diff(arguments: dict, context: Context) -> list[ty
     router_name = arguments.get("router_name", "")
     version = arguments.get("version", 1)
     
-    if router_name not in devices:
-        result = f"Router {router_name} not found in the device mapping."
-    else:
-        log.debug(f"Getting configuration diff from router {router_name} for version {version}")
-        result = _run_junos_cli_command(router_name, f"show configuration | compare rollback {version}")
+    log.debug(f"Getting configuration diff from router {router_name} for version {version}")
+    result = await _run_cli_command(router_name, f"show configuration | compare rollback {version}")
 
     content_block = types.TextContent(
         type="text",
@@ -1123,98 +3010,76 @@ To apply this configuration to devices, set apply_config=true and provide router
                 continue
             
             # Connect to device
-            dev = Device(**connect_params)
-            
-            try:
-                dev.open()
-                await context.info(f"Connected to {rtr_name}")
-                
-                # Load configuration using exclusive mode
-                try:
-                    with Config(dev, mode='exclusive') as cu:
-                        await context.info(f"Loading configuration on {rtr_name}...")
-                        cu.load(rendered_config, format='set')
-                        
-                        # Get diff
-                        diff = cu.diff()
-                        
-                        if not diff:
-                            result_msg = "No configuration changes detected"
-                            application_results.append(f"ℹ️  {rtr_name}: {result_msg}")
-                            await context.info(f"{rtr_name}: {result_msg}")
-                        else:
-                            if dry_run:
-                                # DRY RUN: Perform commit check, show diff, and rollback without committing
-                                await context.info(f"Performing commit check on {rtr_name}...")
-                                
-                                try:
-                                    check_result = cu.commit_check()
-                                    
-                                    if not check_result:
-                                        result_msg = f"Commit check failed - configuration has errors"
-                                        application_results.append(f"❌ {rtr_name}: {result_msg}")
-                                        await context.error(f"{rtr_name}: {result_msg}")
-                                    else:
-                                        result_msg = f"Configuration check successful. Changes:\n\n{diff}"
-                                        application_results.append(f"🔍 {rtr_name}: {result_msg}")
-                                        await context.info(f"{rtr_name}: Dry-run commit check passed")
-                                    
-                                except Exception as check_error:
-                                    result_msg = f"Commit check error: {check_error}"
-                                    application_results.append(f"❌ {rtr_name}: {result_msg}")
-                                    await context.error(f"{rtr_name}: {result_msg}")
-                                finally:
-                                    # CRITICAL: Always rollback in dry-run mode
-                                    await context.info(f"{rtr_name}: Rolling back changes (dry-run mode)")
-                                    try:
-                                        # Perform the rollback
-                                        cu.rollback()
-                                        # Verify rollback success by checking if there are pending changes
-                                        # After a successful rollback, there should be no differences
-                                        diff = cu.diff()
-                                        
-                                        if diff:
-                                            await context.error(f"{rtr_name}: Rollback verification failed - unexpected changes remain")
-                                            await context.error(f"{rtr_name}: Remaining diff:\n{diff}")
-                                        else:
-                                            await context.info(f"{rtr_name}: Rollback verified successfully - no pending changes")
-                                            
-                                    except Exception as rollback_error:
-                                        await context.error(f"{rtr_name}: Rollback failed with error: {str(rollback_error)}")
-                            else:
-                                # REAL COMMIT: Perform commit check before committing
-                                await context.info(f"Performing commit check on {rtr_name}...")
-                                check_result = cu.commit_check()
-                                
-                                if not check_result:
-                                    result_msg = "Commit check failed - configuration has errors"
-                                    application_results.append(f"❌ {rtr_name}: {result_msg}")
-                                    await context.error(f"{rtr_name}: {result_msg}")
-                                    cu.rollback()
-                                else:
-                                    # Apply the changes
-                                    await context.info(f"Committing configuration on {rtr_name}...")
-                                    cu.commit(comment=commit_comment)
-                                    result_msg = f"Configuration committed successfully. Changes:\n\n{diff}"
-                                    application_results.append(f"✅ {rtr_name}: {result_msg}")
-                                    await context.info(f"{rtr_name}: Configuration committed successfully")
+            def _apply_config_sync(junos_device: Device) -> tuple[str, str]:
+                """Apply or dry-run the rendered config on an already-connected device."""
+                with Config(junos_device, mode='exclusive') as cu:
+                    cu.load(rendered_config, format='set')
+                    diff = cu.diff()
 
+                    if not diff:
+                        return ("info", "No configuration changes detected")
+
+                    if dry_run:
+                        try:
+                            check_result = cu.commit_check()
+                            if not check_result:
+                                return ("error", "Commit check failed - configuration has errors")
+                            return ("dry_run", f"Configuration check successful. Changes:\n\n{diff}")
+                        finally:
+                            with suppress(Exception):
+                                cu.rollback()
+                    else:
+                        check_result = cu.commit_check()
+                        if not check_result:
+                            with suppress(Exception):
+                                cu.rollback()
+                            return ("error", "Commit check failed - configuration has errors")
+                        cu.commit(comment=commit_comment)
+                        return ("success", f"Configuration committed successfully. Changes:\n\n{diff}")
+
+            pool = connection_pool
+            if pool is not None and pool.enabled:
+                dev = await pool.get_connection(rtr_name)
+                try:
+                    await context.info(f"Connected to {rtr_name} (pooled)")
+                    status, msg = await anyio.to_thread.run_sync(lambda: _apply_config_sync(dev), limiter=thread_limiter)
                 except (ConfigLoadError, CommitError, LockError) as e:
-                    error_msg = f"Configuration error: {e}"
-                    application_results.append(f"❌ {rtr_name}: {error_msg}")
-                    await context.error(f"{rtr_name}: {error_msg}")
+                    await pool.invalidate_connection(rtr_name)
+                    status, msg = ("error", f"Configuration error: {e}")
+                except ConnectError as e:
+                    await pool.invalidate_connection(rtr_name)
+                    status, msg = ("error", f"Connection failed: {e}")
+                except Exception as e:
+                    await pool.invalidate_connection(rtr_name)
+                    status, msg = ("error", f"Failed to apply configuration: {e}")
+                finally:
+                    await pool.release_connection(rtr_name)
+            else:
+                def _direct_apply() -> tuple[str, str]:
+                    with Device(**connect_params) as dev:
+                        return _apply_config_sync(dev)
 
-            except ConnectError as e:
-                error_msg = f"Connection failed: {e}"
-                application_results.append(f"❌ {rtr_name}: {error_msg}")
-                await context.error(f"{rtr_name}: {error_msg}")
-            finally:
-                # Always close the device connection
                 try:
-                    dev.close()
-                    await context.info(f"Disconnected from {rtr_name}")
-                except Exception as close_error:
-                    log.warning(f"Error while closing test connection to {rtr_name}: {close_error}")
+                    status, msg = await anyio.to_thread.run_sync(_direct_apply, limiter=thread_limiter)
+                except (ConfigLoadError, CommitError, LockError) as e:
+                    status, msg = ("error", f"Configuration error: {e}")
+                except ConnectError as e:
+                    status, msg = ("error", f"Connection failed: {e}")
+                except Exception as e:
+                    status, msg = ("error", f"Failed to apply configuration: {e}")
+
+            if status == "success":
+                application_results.append(f"✅ {rtr_name}: {msg}")
+                await context.info(f"{rtr_name}: Configuration committed successfully")
+            elif status == "dry_run":
+                application_results.append(f"🔍 {rtr_name}: {msg}")
+                await context.info(f"{rtr_name}: Dry-run commit check passed")
+            elif status == "info":
+                application_results.append(f"ℹ️  {rtr_name}: {msg}")
+                await context.info(f"{rtr_name}: {msg}")
+            else:
+                application_results.append(f"❌ {rtr_name}: {msg}")
+                await context.error(f"{rtr_name}: {msg}")
 
         except Exception as e:
             error_msg = f"Failed to apply configuration: {e}"
@@ -1248,6 +3113,950 @@ To apply this configuration to devices, set apply_config=true and provide router
         }
     )]
 
+async def handle_execute_junos_commands_batch(arguments: dict, context: Context) -> list[types.ContentBlock]:
+    """
+    Handler for execute_junos_commands_batch tool - executes multiple commands on multiple routers.
+    
+    This tool allows batching multiple commands to multiple routers in a single MCP request,
+    reducing request/response overhead while benefiting from connection pool reuse.
+    
+    Example: Execute ["show version", "show system uptime"] on ["router1", "router2", "router3"].
+    """
+    start_time = time.time()
+    start_timestamp = datetime.now(timezone.utc).isoformat()
+    router_names = arguments.get("router_names", [])
+    commands = arguments.get("commands", [])
+    cli_format = arguments.get("format")
+    timeout = get_timeout_with_fallback(arguments.get("timeout"))
+
+    connection_mode = arguments.get("connection_mode")
+    if isinstance(connection_mode, str):
+        connection_mode = connection_mode.strip().lower()
+    if connection_mode not in {"pooled", "fresh"}:
+        connection_mode = "pooled"
+
+    auto_fallback_to_fresh = arguments.get("auto_fallback_to_fresh")
+    if auto_fallback_to_fresh is not None:
+        auto_fallback_to_fresh = bool(auto_fallback_to_fresh)
+
+    barrier_sync = bool(arguments.get("barrier_sync"))
+    barrier_policy = arguments.get("barrier_policy") or "proceed"
+    if isinstance(barrier_policy, str):
+        barrier_policy = barrier_policy.strip().lower()
+    if barrier_policy not in {"proceed", "strict"}:
+        barrier_policy = "proceed"
+
+    preconnect_timeout_raw = arguments.get("preconnect_timeout")
+    if isinstance(preconnect_timeout_raw, int) and preconnect_timeout_raw > 0:
+        preconnect_timeout = preconnect_timeout_raw
+    else:
+        preconnect_timeout = 30
+
+    preconnect_retries_raw = arguments.get("preconnect_retries")
+    if isinstance(preconnect_retries_raw, int) and preconnect_retries_raw >= 0:
+        preconnect_retries = min(preconnect_retries_raw, 10)
+    else:
+        preconnect_retries = 2
+
+    preconnect_backoff_raw = arguments.get("preconnect_backoff_seconds")
+    if isinstance(preconnect_backoff_raw, int) and preconnect_backoff_raw >= 0:
+        preconnect_backoff_seconds = min(preconnect_backoff_raw, 60)
+    else:
+        preconnect_backoff_seconds = 1
+
+    # Concurrency is set once at server startup.
+    
+    # Validation
+    if not router_names or not isinstance(router_names, list):
+        return [types.TextContent(
+            type="text",
+            text="Error: router_names must be a non-empty array of strings"
+        )]
+    
+    if len(router_names) == 0:
+        return [types.TextContent(
+            type="text",
+            text="Error: router_names array cannot be empty"
+        )]
+    
+    if not commands or not isinstance(commands, list):
+        return [types.TextContent(
+            type="text",
+            text="Error: commands must be a non-empty array of strings"
+        )]
+    
+    if len(commands) == 0:
+        return [types.TextContent(
+            type="text",
+            text="Error: commands array cannot be empty"
+        )]
+    
+    # Validate all routers exist
+    invalid_routers = [r for r in router_names if r not in devices]
+    if invalid_routers:
+        return [types.TextContent(
+            type="text",
+            text=f"Error: Routers not found in device mapping: {', '.join(invalid_routers)}"
+        )]
+    
+    log.info(
+        f"Executing {len(commands)} commands on {len(router_names)} routers with timeout {timeout}s "
+        f"(barrier_sync={barrier_sync}, policy={barrier_policy}, preconnect_timeout={preconnect_timeout}s, "
+        f"preconnect_retries={preconnect_retries})"
+    )
+
+    # Optional barrier sync: preconnect to all routers first, then execute commands only on ready routers.
+    preconnect_info: dict[str, Any] | None = None
+    routers_to_execute = list(router_names)
+    preconnect_failed_map: dict[str, str] = {}
+
+    if barrier_sync:
+        import asyncio
+        pool = connection_pool
+
+        async def _preconnect_one(router_name: str) -> dict[str, Any]:
+            started = time.time()
+            last_error: str | None = None
+
+            for attempt in range(preconnect_retries + 1):
+                device = None
+                try:
+                    if connection_mode != "fresh" and pool is not None and pool.enabled:
+                        with anyio.fail_after(preconnect_timeout):
+                            device = await pool.get_connection(router_name)
+                    else:
+                        device_info = devices[router_name]
+                        connect_params = prepare_connection_params(device_info, router_name)
+
+                        def _open_and_close() -> None:
+                            with Device(**connect_params) as dev:
+                                dev.timeout = preconnect_timeout
+
+                        with anyio.fail_after(preconnect_timeout):
+                            await anyio.to_thread.run_sync(_open_and_close, limiter=thread_limiter)
+
+                    duration = round(time.time() - started, 3)
+                    return {
+                        "router_name": router_name,
+                        "status": "connected",
+                        "attempts": attempt + 1,
+                        "duration": duration,
+                    }
+                except Exception as e:
+                    last_error = str(e)
+                    if pool is not None and pool.enabled:
+                        with suppress(Exception):
+                            await pool.invalidate_connection(router_name)
+                    if attempt == preconnect_retries:
+                        duration = round(time.time() - started, 3)
+                        return {
+                            "router_name": router_name,
+                            "status": "failed",
+                            "attempts": attempt + 1,
+                            "duration": duration,
+                            "error": last_error,
+                        }
+                    if preconnect_backoff_seconds:
+                        await asyncio.sleep(preconnect_backoff_seconds)
+                finally:
+                    if device is not None and pool is not None and pool.enabled:
+                        with suppress(Exception):
+                            await pool.release_connection(router_name)
+
+            duration = round(time.time() - started, 3)
+            return {
+                "router_name": router_name,
+                "status": "failed",
+                "attempts": preconnect_retries + 1,
+                "duration": duration,
+                "error": last_error or "unknown preconnect failure",
+            }
+
+        preconnect_start = time.time()
+        preconnect_results = await asyncio.gather(
+            *[_preconnect_one(r) for r in router_names],
+            return_exceptions=False,
+        )
+        preconnect_duration = round(time.time() - preconnect_start, 3)
+
+        ready = [r["router_name"] for r in preconnect_results if r.get("status") == "connected"]
+        failed = [r for r in preconnect_results if r.get("status") != "connected"]
+        preconnect_failed_map = {
+            r.get("router_name"): (r.get("error") or "preconnect failed")
+            for r in failed
+            if r.get("router_name")
+        }
+
+        preconnect_info = {
+            "enabled": True,
+            "policy": barrier_policy,
+            "timeout": preconnect_timeout,
+            "retries": preconnect_retries,
+            "backoff_seconds": preconnect_backoff_seconds,
+            "duration": preconnect_duration,
+            "ready_count": len(ready),
+            "failed_count": len(failed),
+            "failed_routers": failed,
+        }
+
+        if barrier_policy == "strict" and preconnect_failed_map:
+            # Fail fast: do not run any commands if not all routers connected.
+            end_time = time.time()
+            end_timestamp = datetime.now(timezone.utc).isoformat()
+            total_duration = round(end_time - start_time, 3)
+
+            strict_not_executed = len(router_names) - len(preconnect_failed_map)
+            strict_breakdown: dict[str, int] = {
+                "preconnect_failed": len(preconnect_failed_map),
+                "auth": 0,
+                "transport": 0,
+                "timeout": 0,
+                "cli": 0,
+                "other": strict_not_executed,
+            }
+
+            response_mode = _resolve_effective_response_mode(arguments)
+            response: dict[str, Any] = {
+                "error": "preconnect_failed",
+                "message": "Barrier preconnect failed for one or more routers; strict policy prevents execution.",
+                "total_routers": len(router_names),
+                "total_commands_per_router": len(commands),
+                "total_commands_executed": 0,
+                "total_successful": 0,
+                "total_failed": len(router_names) * len(commands),
+                "not_executed_due_to_strict_policy": strict_not_executed,
+                "failure_breakdown": strict_breakdown,
+                "total_duration": total_duration,
+                "start_time": start_timestamp,
+                "end_time": end_timestamp,
+                "preconnect": preconnect_info,
+            }
+
+            response["connection"] = {
+                "connection_mode": connection_mode,
+                "auto_fallback_to_fresh": auto_fallback_to_fresh,
+            }
+
+            response["retry_stats"] = {
+                "commands_used_pooled": 0,
+                "commands_used_fresh": 0,
+                "commands_with_fresh_fallback_attempted": 0,
+                "commands_with_fresh_fallback_succeeded": 0,
+                "commands_with_fresh_fallback_failed": 0,
+            }
+
+            if _should_persist_to_disk(arguments, response_mode):
+                try:
+                    artifact = await _persist_json_artifact(
+                        tool_name="execute_junos_commands_batch",
+                        arguments=arguments,
+                        payload={
+                            "request": {
+                                "router_names": router_names,
+                                "commands": commands,
+                                "timeout": timeout,
+                                "connection_mode": connection_mode,
+                                "auto_fallback_to_fresh": auto_fallback_to_fresh,
+                                "barrier_sync": True,
+                                "barrier_policy": barrier_policy,
+                                "preconnect_timeout": preconnect_timeout,
+                                "preconnect_retries": preconnect_retries,
+                                "preconnect_backoff_seconds": preconnect_backoff_seconds,
+                            },
+                            "preconnect": preconnect_info,
+                            "summary": {
+                                "total_routers": len(router_names),
+                                "total_commands_per_router": len(commands),
+                                "total_commands_executed": 0,
+                                "total_successful": 0,
+                                "total_failed": len(router_names) * len(commands),
+                                "not_executed_due_to_strict_policy": strict_not_executed,
+                                "failure_breakdown": strict_breakdown,
+                                "connection": response.get("connection"),
+                                "retry_stats": response.get("retry_stats"),
+                                "total_duration": total_duration,
+                                "start_time": start_timestamp,
+                                "end_time": end_timestamp,
+                            },
+                            "routers": [],
+                        },
+                    )
+                    response["artifact"] = artifact
+                except Exception as e:
+                    log.warning(f"Failed to persist batch artifact: {e}")
+
+            if response_mode == "artifact":
+                response.pop("routers", None)
+
+            import json
+            return [types.TextContent(type="text", text=json.dumps(response, indent=2))]
+
+        routers_to_execute = ready
+    
+    
+    # Execute commands on all routers in parallel using asyncio.gather
+    async def execute_router_commands(router_name: str):
+        """Execute all commands on a single router sequentially."""
+        router_start = time.time()
+        router_results = []
+        
+        for idx, command in enumerate(commands, 1):
+            cmd_start = time.time()
+            cmd_start_ts = datetime.now(timezone.utc).isoformat()
+            
+            try:
+                log.debug(f"[{router_name}][{idx}/{len(commands)}] Executing: {command}")
+
+                meta = await _run_cli_command_with_meta(
+                    router_name,
+                    command,
+                    timeout,
+                    cli_format=cli_format,
+                    connection_mode=connection_mode,
+                    auto_fallback_to_fresh=auto_fallback_to_fresh,
+                )
+                result = str(meta.get("output") or "")
+                failure_category = meta.get("failure_category")
+                failure_hint = meta.get("failure_hint")
+                is_error = failure_category != "success"
+                
+                cmd_end = time.time()
+                cmd_duration = round(cmd_end - cmd_start, 3)
+                
+                cmd_result: dict[str, Any] = {
+                    "command": command,
+                    "format": cli_format,
+                    "success": (not is_error),
+                    "output": result,
+                    "execution_duration": cmd_duration,
+                    "start_time": cmd_start_ts,
+                    "end_time": datetime.now(timezone.utc).isoformat(),
+                    "connection_mode_used": meta.get("connection_mode_used"),
+                    "attempts": meta.get("attempts"),
+                    "fresh_fallback_attempted": meta.get("fresh_fallback_attempted"),
+                    "fresh_fallback_succeeded": meta.get("fresh_fallback_succeeded"),
+                }
+                if is_error:
+                    cmd_result["error"] = result
+                    cmd_result["failure_category"] = failure_category
+                    if failure_hint:
+                        cmd_result["failure_hint"] = failure_hint
+                elif meta.get("fresh_fallback_attempted"):
+                    if meta.get("pooled_failure_category"):
+                        cmd_result["pooled_failure_category"] = meta.get("pooled_failure_category")
+                    if meta.get("pooled_failure_hint"):
+                        cmd_result["pooled_failure_hint"] = meta.get("pooled_failure_hint")
+                router_results.append(cmd_result)
+                
+                log.debug(f"[{router_name}][{idx}/{len(commands)}] Completed in {cmd_duration}s")
+                
+            except Exception as e:
+                cmd_end = time.time()
+                cmd_duration = round(cmd_end - cmd_start, 3)
+                error_msg = str(e)
+
+                failure_category, failure_hint = _classify_failure_text(error_msg)
+                if failure_category == "success":
+                    failure_category = "other"
+                
+                router_results.append({
+                    "command": command,
+                    "success": False,
+                    "error": error_msg,
+                    "failure_category": failure_category,
+                    "failure_hint": (failure_hint or error_msg)[:160] if error_msg else failure_hint,
+                    "execution_duration": cmd_duration,
+                    "start_time": cmd_start_ts,
+                    "end_time": datetime.now(timezone.utc).isoformat()
+                })
+                
+                log.error(f"[{router_name}][{idx}/{len(commands)}] Failed: {error_msg}")
+        
+        router_end = time.time()
+        router_duration = round(router_end - router_start, 3)
+        
+        successful = sum(1 for r in router_results if r.get("success"))
+        failed = len(router_results) - successful
+        
+        return {
+            "router_name": router_name,
+            "total_commands": len(commands),
+            "executed_commands": len(commands),
+            "successful": successful,
+            "failed": failed,
+            "router_duration": router_duration,
+            "results": router_results
+        }
+    
+    # Execute all ready routers in parallel
+    import asyncio
+    router_responses = await asyncio.gather(
+        *[execute_router_commands(router) for router in routers_to_execute],
+        return_exceptions=True
+    )
+    
+    # Process results, handling any exceptions
+    processed_responses = []
+    for idx, response in enumerate(router_responses):
+        if isinstance(response, Exception):
+            router_name = routers_to_execute[idx]
+            processed_responses.append({
+                "router_name": router_name,
+                "total_commands": len(commands),
+                "executed_commands": 0,
+                "successful": 0,
+                "failed": len(commands),
+                "router_duration": 0,
+                "error": str(response),
+                "results": []
+            })
+            log.error(f"Router {router_name} execution failed: {response}")
+        else:
+            processed_responses.append(response)
+
+    # If barrier_sync is enabled and we're proceeding with a subset, record skipped routers.
+    if barrier_sync and preconnect_failed_map:
+        for skipped_router, err in preconnect_failed_map.items():
+            processed_responses.append({
+                "router_name": skipped_router,
+                "total_commands": len(commands),
+                "executed_commands": 0,
+                "successful": 0,
+                "failed": len(commands),
+                "router_duration": 0,
+                "error": f"preconnect_failed (skipped execution): {err}",
+                "failure_category": "preconnect_failed",
+                "failure_hint": str(err)[:160] if err else "preconnect_failed",
+                "results": [],
+            })
+    
+    # Calculate totals
+    end_time = time.time()
+    end_timestamp = datetime.now(timezone.utc).isoformat()
+    total_duration = round(end_time - start_time, 3)
+    
+    total_commands_executed = sum(int(r.get("executed_commands") or 0) for r in processed_responses)
+    total_successful = sum(r["successful"] for r in processed_responses)
+    total_failed = sum(r["failed"] for r in processed_responses)
+    
+    response_mode = _resolve_effective_response_mode(arguments)
+
+    # Build response
+    response: dict[str, Any] = {
+        "total_routers": len(router_names),
+        "total_routers_executed": len(routers_to_execute),
+        "total_routers_preconnect_failed": len(preconnect_failed_map) if barrier_sync else 0,
+        "total_commands_per_router": len(commands),
+        "total_commands_executed": total_commands_executed,
+        "total_successful": total_successful,
+        "total_failed": total_failed,
+        "total_duration": total_duration,
+        "start_time": start_timestamp,
+        "end_time": end_timestamp,
+    }
+
+    response["connection"] = {
+        "connection_mode": connection_mode,
+        "auto_fallback_to_fresh": auto_fallback_to_fresh,
+    }
+
+    # Failure breakdown by router (not by command) for operator-friendly reporting.
+    breakdown: dict[str, int] = {"preconnect_failed": 0, "auth": 0, "transport": 0, "timeout": 0, "cli": 0, "other": 0}
+    for r in processed_responses:
+        cat = r.get("failure_category")
+        hint = r.get("failure_hint")
+        if not isinstance(cat, str) or not cat:
+            cat, hint = _rollup_router_failure_category(r)
+        if cat == "success":
+            continue
+        if cat not in breakdown:
+            cat = "other"
+        breakdown[cat] += 1
+
+    response["failure_breakdown"] = breakdown
+
+    # Optional: failure breakdown by command (all failed commands across all routers).
+    cmd_breakdown: dict[str, int] = {"preconnect_failed": 0, "auth": 0, "transport": 0, "timeout": 0, "cli": 0, "other": 0}
+    for r in processed_responses:
+        # Router-level skips count as failures for every command.
+        r_cat = r.get("failure_category")
+        if isinstance(r_cat, str) and r_cat == "preconnect_failed":
+            cmd_breakdown["preconnect_failed"] += len(commands)
+            continue
+
+        results = r.get("results")
+        if not isinstance(results, list):
+            continue
+        for item in results:
+            if not isinstance(item, dict):
+                continue
+            if item.get("success") is True:
+                continue
+            cat = item.get("failure_category")
+            if not isinstance(cat, str) or not cat:
+                err = item.get("error")
+                cat, _ = _classify_failure_text(err if isinstance(err, str) else "")
+            if cat == "success":
+                cat = "other"
+            if cat not in cmd_breakdown:
+                cat = "other"
+            cmd_breakdown[cat] += 1
+
+    response["failure_breakdown_commands"] = cmd_breakdown
+
+    # Retry/healing statistics (command-level)
+    cmds_used_pooled = 0
+    cmds_used_fresh = 0
+    cmds_fallback_attempted = 0
+    cmds_fallback_succeeded = 0
+
+    for r in processed_responses:
+        # Router-level skips: no commands were executed.
+        if r.get("failure_category") == "preconnect_failed":
+            continue
+        items = r.get("results")
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            mode_used = item.get("connection_mode_used")
+            if mode_used == "pooled":
+                cmds_used_pooled += 1
+            elif mode_used == "fresh":
+                cmds_used_fresh += 1
+            if item.get("fresh_fallback_attempted") is True:
+                cmds_fallback_attempted += 1
+            if item.get("fresh_fallback_succeeded") is True:
+                cmds_fallback_succeeded += 1
+
+    response["retry_stats"] = {
+        "commands_used_pooled": cmds_used_pooled,
+        "commands_used_fresh": cmds_used_fresh,
+        "commands_with_fresh_fallback_attempted": cmds_fallback_attempted,
+        "commands_with_fresh_fallback_succeeded": cmds_fallback_succeeded,
+        "commands_with_fresh_fallback_failed": max(0, cmds_fallback_attempted - cmds_fallback_succeeded),
+    }
+
+    if barrier_sync and preconnect_info is not None:
+        response["preconnect"] = preconnect_info
+
+    if response_mode in {"summary", "artifact"}:
+        router_summaries = []
+        for r in processed_responses:
+            cat = r.get("failure_category")
+            hint = r.get("failure_hint")
+            if not isinstance(cat, str) or not cat:
+                cat, hint = _rollup_router_failure_category(r)
+            router_summaries.append({
+                "router_name": r.get("router_name"),
+                "executed_commands": r.get("executed_commands"),
+                "successful": r.get("successful"),
+                "failed": r.get("failed"),
+                "router_duration": r.get("router_duration"),
+                "error": r.get("error"),
+                "failure_category": cat,
+                "failure_hint": hint,
+            })
+
+        failed_routers = [r for r in router_summaries if (r.get("failed") or 0) > 0 or r.get("error")]
+        slowest_routers = sorted(
+            [r for r in router_summaries if isinstance(r.get("router_duration"), (int, float))],
+            key=lambda x: x.get("router_duration", 0),
+            reverse=True,
+        )[:10]
+
+        response["failed_routers"] = failed_routers
+        response["slowest_routers"] = slowest_routers
+    else:
+        response["routers"] = processed_responses
+
+    # Optionally persist full results (even if we're returning only a summary).
+    if _should_persist_to_disk(arguments, response_mode):
+        try:
+            artifact = await _persist_json_artifact(
+                tool_name="execute_junos_commands_batch",
+                arguments=arguments,
+                payload={
+                    "request": {
+                        "router_names": router_names,
+                        "commands": commands,
+                        "timeout": timeout,
+                        "connection_mode": connection_mode,
+                        "auto_fallback_to_fresh": auto_fallback_to_fresh,
+                        "barrier_sync": barrier_sync,
+                        "barrier_policy": barrier_policy,
+                        "preconnect_timeout": preconnect_timeout,
+                        "preconnect_retries": preconnect_retries,
+                        "preconnect_backoff_seconds": preconnect_backoff_seconds,
+                    },
+                    "preconnect": preconnect_info,
+                    "summary": {
+                        "total_routers": len(router_names),
+                        "total_routers_executed": len(routers_to_execute),
+                        "total_routers_preconnect_failed": len(preconnect_failed_map) if barrier_sync else 0,
+                        "total_commands_per_router": len(commands),
+                        "total_commands_executed": total_commands_executed,
+                        "total_successful": total_successful,
+                        "total_failed": total_failed,
+                        "failure_breakdown": response.get("failure_breakdown"),
+                        "connection": response.get("connection"),
+                        "retry_stats": response.get("retry_stats"),
+                        "total_duration": total_duration,
+                        "start_time": start_timestamp,
+                        "end_time": end_timestamp,
+                    },
+                    "routers": processed_responses,
+                },
+            )
+            response["artifact"] = artifact
+        except Exception as e:
+            log.warning(f"Failed to persist batch artifact: {e}")
+
+    # In artifact mode, never include large raw outputs in the tool response.
+    if response_mode == "artifact":
+        response.pop("routers", None)
+    
+    import json
+    response_text = json.dumps(response, indent=2)
+    
+    content_block = types.TextContent(
+        type="text",
+        text=response_text,
+        annotations={
+            "routers_count": len(router_names),
+            "commands_count": len(commands),
+            "metadata": {
+                "total_duration": total_duration,
+                "total_successful": total_successful,
+                "total_failed": total_failed
+            }
+        }
+    )
+    
+    log.info(f"Completed {len(commands)} commands on {len(router_names)} routers: {total_successful} success, {total_failed} failed, {total_duration}s total")
+    return [content_block]
+
+
+async def handle_read_artifact(arguments: dict, context: Context) -> list[types.ContentBlock]:
+    """Read a previously persisted artifact.
+
+    Supports fetching by absolute/relative path (disk) or by run_id via the
+    configured backend (disk/redis/dual).
+    """
+    artifact_path = arguments.get("artifact_path")
+    run_id = arguments.get("run_id")
+    # Default to full (legacy behavior): return the full stored payload
+    # unless the caller explicitly requests a compact view (diff/summary/etc).
+    mode = arguments.get("mode") or "full"
+    max_output_chars = arguments.get("max_output_chars")
+
+    # diff mode knobs
+    diff_include_diffs = arguments.get("diff_include_diffs")
+    diff_context_lines = arguments.get("diff_context_lines")
+    diff_max_diff_chars = arguments.get("diff_max_diff_chars")
+    diff_max_routers_per_group = arguments.get("diff_max_routers_per_group")
+    diff_max_groups = arguments.get("diff_max_groups")
+
+    # Optional: return only a subset of routers from a large artifact.
+    # This enables token-safe workflows where you collect once (many routers)
+    # and read back in smaller chunks.
+    filter_router_names = arguments.get("router_names")
+    filter_router_offset = arguments.get("router_offset")
+    filter_router_limit = arguments.get("router_limit")
+
+    if isinstance(mode, str):
+        mode = mode.strip().lower()
+    if mode not in {"metadata", "summary", "failures", "full", "diff"}:
+        mode = "full"
+
+    if not isinstance(max_output_chars, int) or max_output_chars <= 0:
+        max_output_chars = 4000
+
+    def _filter_artifact_by_router(obj: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        """Return a shallow-copied artifact with filtered router entries.
+
+        Supports both payload shapes:
+        - execute_junos_command_batch artifacts: key "results" (list)
+        - execute_junos_commands_batch artifacts: key "routers" (list)
+
+        Returns (filtered_obj, filter_meta_or_none).
+        """
+
+        key: str | None = None
+        items: list[Any] | None = None
+        if isinstance(obj.get("results"), list):
+            key = "results"
+            items = obj.get("results")
+        elif isinstance(obj.get("routers"), list):
+            key = "routers"
+            items = obj.get("routers")
+
+        if key is None or items is None:
+            return obj, None
+
+        # Determine filter mode.
+        selected_names: set[str] | None = None
+        if isinstance(filter_router_names, list):
+            selected_names = {str(x) for x in filter_router_names if isinstance(x, str) and x.strip()}
+
+        offset = filter_router_offset if isinstance(filter_router_offset, int) and filter_router_offset >= 0 else None
+        limit = filter_router_limit if isinstance(filter_router_limit, int) and filter_router_limit > 0 else None
+
+        filtered_items = list(items)
+        if selected_names is not None:
+            filtered_items = [
+                it for it in filtered_items
+                if isinstance(it, dict) and it.get("router_name") in selected_names
+            ]
+        elif offset is not None or limit is not None:
+            start = offset or 0
+            end = (start + limit) if limit is not None else None
+            filtered_items = filtered_items[start:end]
+        else:
+            return obj, None
+
+        filtered_obj: dict[str, Any] = dict(obj)
+        filtered_obj[key] = filtered_items
+
+        # Add some light filter metadata (doesn't change the underlying stored artifact).
+        filter_meta: dict[str, Any] = {
+            "applied": True,
+            "key": key,
+            "original_count": len(items),
+            "returned_count": len(filtered_items),
+        }
+        if selected_names is not None:
+            filter_meta["router_names"] = sorted(selected_names)
+        if offset is not None:
+            filter_meta["router_offset"] = offset
+        if limit is not None:
+            filter_meta["router_limit"] = limit
+
+        if isinstance(filtered_obj.get("summary"), dict):
+            filtered_obj["summary"] = dict(filtered_obj["summary"])
+            filtered_obj["summary"]["filtered_total_routers"] = len(filtered_items)
+
+        return filtered_obj, filter_meta
+
+    backend = _get_artifact_backend(arguments)
+    artifact_dir = _get_artifact_dir(arguments)
+
+    disk_fallback_used = False
+    disk_fallback_reason: str | None = None
+
+    resolved_path: str | None = None
+
+    if isinstance(artifact_path, str) and artifact_path.strip():
+        # Explicit disk path read (works regardless of backend).
+        resolved_path = os.path.abspath(os.path.expanduser(artifact_path.strip()))
+        try:
+            with open(resolved_path, "r", encoding="utf-8") as f:
+                raw = f.read()
+            artifact_obj = json.loads(raw)
+        except FileNotFoundError:
+            return [types.TextContent(
+                type="text",
+                text=json.dumps({
+                    "error": "artifact_not_found",
+                    "artifact_path": resolved_path,
+                }, indent=2),
+            )]
+        except json.JSONDecodeError as e:
+            return [types.TextContent(
+                type="text",
+                text=json.dumps({
+                    "error": "invalid_artifact_json",
+                    "artifact_path": resolved_path,
+                    "message": str(e),
+                }, indent=2),
+            )]
+        except Exception as e:
+            return [types.TextContent(
+                type="text",
+                text=json.dumps({
+                    "error": "artifact_read_failed",
+                    "artifact_path": resolved_path,
+                    "message": str(e),
+                }, indent=2),
+            )]
+    elif isinstance(run_id, str) and run_id.strip():
+        rid = run_id.strip()
+        store: ArtifactStore | None = None
+        loaded_from_disk = False
+
+        try:
+            store = _get_artifact_store(arguments)
+        except Exception as e:
+            if backend == "redis":
+                disk_path = _find_artifact_by_run_id(rid, artifact_dir)
+                if disk_path:
+                    try:
+                        with open(disk_path, "r", encoding="utf-8") as f:
+                            artifact_obj = json.loads(f.read())
+                        resolved_path = disk_path
+                        loaded_from_disk = True
+                        disk_fallback_used = True
+                        disk_fallback_reason = str(e)
+                    except Exception:
+                        loaded_from_disk = False
+
+                if not loaded_from_disk:
+                    return [types.TextContent(
+                        type="text",
+                        text=json.dumps({
+                            "error": "artifact_store_unavailable",
+                            "backend": backend,
+                            "artifact_dir": artifact_dir,
+                            "run_id": rid,
+                            "message": str(e),
+                            "how_to_fix": {
+                                "prefer_disk": {"JMCP_ARTIFACT_BACKEND": "disk", "JMCP_ARTIFACT_DIR": artifact_dir},
+                                "use_redis": {"JMCP_ARTIFACT_BACKEND": "redis", "JMCP_REDIS_URL": "redis://<user>:<pass>@<host>:6379/0"},
+                            },
+                        }, indent=2, ensure_ascii=False),
+                    )]
+            else:
+                return [types.TextContent(
+                    type="text",
+                    text=json.dumps({
+                        "error": "artifact_store_unavailable",
+                        "backend": backend,
+                        "artifact_dir": artifact_dir,
+                        "run_id": rid,
+                        "message": str(e),
+                    }, indent=2, ensure_ascii=False),
+                )]
+
+        if not loaded_from_disk:
+            if store is None:
+                return [types.TextContent(
+                    type="text",
+                    text=json.dumps({
+                        "error": "artifact_store_unavailable",
+                        "backend": backend,
+                        "artifact_dir": artifact_dir,
+                        "run_id": rid,
+                        "message": "artifact store not initialized",
+                    }, indent=2, ensure_ascii=False),
+                )]
+
+            def _do_read() -> dict[str, Any]:
+                return store.read_json(run_id=rid)
+
+            try:
+                artifact_obj = await anyio.to_thread.run_sync(_do_read, limiter=thread_limiter)
+            except FileNotFoundError:
+                return [types.TextContent(
+                    type="text",
+                    text=json.dumps({
+                        "error": "artifact_not_found",
+                        "backend": backend,
+                        "artifact_dir": artifact_dir,
+                        "run_id": rid,
+                    }, indent=2, ensure_ascii=False),
+                )]
+            except Exception as e:
+                if backend == "redis":
+                    disk_path = _find_artifact_by_run_id(rid, artifact_dir)
+                    if disk_path:
+                        try:
+                            with open(disk_path, "r", encoding="utf-8") as f:
+                                artifact_obj = json.loads(f.read())
+                            resolved_path = disk_path
+                            loaded_from_disk = True
+                            disk_fallback_used = True
+                            disk_fallback_reason = str(e)
+                        except Exception:
+                            loaded_from_disk = False
+
+                    if not loaded_from_disk:
+                        return [types.TextContent(
+                            type="text",
+                            text=json.dumps({
+                                "error": "artifact_read_failed",
+                                "backend": backend,
+                                "artifact_dir": artifact_dir,
+                                "run_id": rid,
+                                "message": str(e),
+                                "how_to_fix": {
+                                    "prefer_disk": {"JMCP_ARTIFACT_BACKEND": "disk", "JMCP_ARTIFACT_DIR": artifact_dir},
+                                    "use_redis": {"JMCP_ARTIFACT_BACKEND": "redis", "JMCP_REDIS_URL": "redis://<user>:<pass>@<host>:6379/0"},
+                                },
+                            }, indent=2, ensure_ascii=False),
+                        )]
+
+                    # Disk fallback succeeded: continue to normal view rendering.
+                else:
+                    return [types.TextContent(
+                        type="text",
+                        text=json.dumps({
+                            "error": "artifact_read_failed",
+                            "backend": backend,
+                            "artifact_dir": artifact_dir,
+                            "run_id": rid,
+                            "message": str(e),
+                        }, indent=2, ensure_ascii=False),
+                    )]
+    else:
+        return [types.TextContent(
+            type="text",
+            text=json.dumps({
+                "error": "missing_parameters",
+                "message": "Provide artifact_path or run_id",
+            }, indent=2),
+        )]
+
+    # Prepare an artifact object for rendering (optional router filtering, optional diff knobs).
+    artifact_for_view: dict[str, Any] | Any = artifact_obj
+    filter_meta: dict[str, Any] | None = None
+
+    if isinstance(artifact_obj, dict):
+        filtered_artifact_obj, filter_meta = _filter_artifact_by_router(artifact_obj)
+        if filter_meta is not None:
+            artifact_for_view = filtered_artifact_obj
+
+        if mode == "diff":
+            diff_opts: dict[str, Any] = {}
+            if diff_include_diffs is not None:
+                diff_opts["include_diffs"] = bool(diff_include_diffs)
+            if isinstance(diff_context_lines, int):
+                diff_opts["context_lines"] = diff_context_lines
+            if isinstance(diff_max_diff_chars, int):
+                diff_opts["max_diff_chars"] = diff_max_diff_chars
+            if isinstance(diff_max_routers_per_group, int):
+                diff_opts["max_routers_per_group"] = diff_max_routers_per_group
+            if isinstance(diff_max_groups, int):
+                diff_opts["max_diff_groups"] = diff_max_groups
+
+            if diff_opts:
+                tmp_obj = dict(artifact_for_view)
+                tmp_obj["_diff_opts"] = diff_opts
+                artifact_for_view = tmp_obj
+
+    view = _render_artifact_view(artifact_for_view, mode=mode, max_output_chars=max_output_chars)
+    if filter_meta is not None and isinstance(view, dict):
+        view["filter"] = filter_meta
+
+    if disk_fallback_used and backend == "redis":
+        view.setdefault("warnings", []).append(_artifact_backend_fallback_warning(
+            operation="read_artifact",
+            requested_backend=backend,
+            artifact_dir=artifact_dir,
+            reason=disk_fallback_reason or "redis unavailable",
+        ))
+        view["requested_backend"] = backend
+        view["backend"] = "disk"
+    else:
+        view["backend"] = backend
+
+    if resolved_path is not None:
+        view["artifact_path"] = resolved_path
+    view.setdefault("artifact_dir", artifact_dir)
+    return [types.TextContent(type="text", text=json.dumps(view, indent=2, ensure_ascii=False))]
+
+
+
 async def handle_gather_device_facts(arguments: dict, context: Context) -> list[types.ContentBlock]:
     """Handler for gather_device_facts tool"""
     router_name = arguments.get("router_name", "")
@@ -1257,33 +4066,57 @@ async def handle_gather_device_facts(arguments: dict, context: Context) -> list[
         result = f"Router {router_name} not found in the device mapping."
     else:
         log.debug(f"Getting facts from router {router_name} with timeout {timeout}s")
-        device_info = devices[router_name]
-        try:
+
+        # Custom JSON encoder to handle version_info and other complex objects
+        def json_serializer(obj):
+            if hasattr(obj, '_asdict'):  # Named tuples like version_info
+                return obj._asdict()
+            elif hasattr(obj, '__dict__'):  # Objects with __dict__
+                return obj.__dict__
+            else:
+                return str(obj)
+
+        async def _facts_to_json() -> str:
+            pool = connection_pool
+            if pool is not None and pool.enabled:
+                device = await pool.get_connection(router_name)
+                try:
+                    def _do_facts() -> str:
+                        device.timeout = timeout
+                        facts_dict = dict(device.facts)
+                        return json.dumps(facts_dict, indent=2, default=json_serializer)
+
+                    return await anyio.to_thread.run_sync(_do_facts, limiter=thread_limiter)
+                except ConnectError as ce:
+                    await pool.invalidate_connection(router_name)
+                    return f"Connection error to {router_name}: {ce}"
+                except Exception as e:
+                    await pool.invalidate_connection(router_name)
+                    return f"An error occurred: {e}"
+                finally:
+                    await pool.release_connection(router_name)
+
+            # Pool disabled: open/run/close in one thread
+            device_info = devices[router_name]
             connect_params = prepare_connection_params(device_info, router_name)
             connect_params['timeout'] = timeout
+
+            def _direct_facts() -> str:
+                with Device(**connect_params) as junos_device:
+                    facts_dict = dict(junos_device.facts)
+                    return json.dumps(facts_dict, indent=2, default=json_serializer)
+
+            try:
+                return await anyio.to_thread.run_sync(_direct_facts, limiter=thread_limiter)
+            except ConnectError as ce:
+                return f"Connection error to {router_name}: {ce}"
+            except Exception as e:
+                return f"An error occurred: {e}"
+
+        try:
+            result = await _facts_to_json()
         except ValueError as ve:
             result = f"Error: {ve}"
-        else:
-            try:
-                with Device(**connect_params) as junos_device:
-                    facts = junos_device.facts
-                    # Convert _FactCache to a regular dict
-                    facts_dict = dict(facts)
-                    
-                    # Custom JSON encoder to handle version_info and other complex objects
-                    def json_serializer(obj):
-                        if hasattr(obj, '_asdict'):  # Named tuples like version_info
-                            return obj._asdict()
-                        elif hasattr(obj, '__dict__'):  # Objects with __dict__
-                            return obj.__dict__
-                        else:
-                            return str(obj)
-                    
-                    result = json.dumps(facts_dict, indent=2, default=json_serializer)
-            except ConnectError as ce:
-                result = f"Connection error to {router_name}: {ce}"
-            except Exception as e:
-                result = f"An error occurred: {e}"
 
     content_block = types.TextContent(
         type="text",
@@ -1345,61 +4178,71 @@ async def handle_load_and_commit_config(arguments: dict, context: Context) -> li
         result = f"Router {router_name} not found in the device mapping."
     else:
         log.debug(f"Loading and committing config on router {router_name} with format {config_format}")
-        device_info = devices[router_name]
-        
         try:
+            device_info = devices[router_name]
             connect_params = prepare_connection_params(device_info, router_name)
         except ValueError as ve:
             result = f"Error: {ve}"
         else:
-            try:
-                with Device(**connect_params) as junos_device:
-                    # Initialize configuration utility
-                    config_util = Config(junos_device)
-                    
-                    # Lock the configuration
-                    try:
-                        config_util.lock()
-                    except Exception as e:
-                        result = f"Failed to lock configuration: {e}"
+            pool = connection_pool
+
+            def _commit_logic(junos_device: Device) -> str:
+                config_util = Config(junos_device)
+                try:
+                    config_util.lock()
+                except Exception as e:
+                    return f"Failed to lock configuration: {e}"
+
+                try:
+                    fmt = config_format.lower()
+                    if fmt == "set":
+                        config_util.load(config_text, format='set')
+                    elif fmt == "text":
+                        config_util.load(config_text, format='text')
+                    elif fmt == "xml":
+                        config_util.load(config_text, format='xml')
                     else:
-                        try:
-                            # Load the configuration based on format
-                            if config_format.lower() == "set":
-                                config_util.load(config_text, format='set')
-                            elif config_format.lower() == "text":
-                                config_util.load(config_text, format='text')
-                            elif config_format.lower() == "xml":
-                                config_util.load(config_text, format='xml')
-                            else:
-                                config_util.unlock()
-                                result = f"Error: Unsupported config format '{config_format}'. Use 'set', 'text', or 'xml'"
-                            
-                            if 'result' not in locals():
-                                # Check for differences
-                                diff = config_util.diff()
-                                if not diff:
-                                    config_util.unlock()
-                                    result = "No configuration changes detected"
-                                else:
-                                    # Commit the configuration
-                                    config_util.commit(comment=commit_comment, timeout=timeout)
-                                    config_util.unlock()
-                                    result = f"Configuration successfully loaded and committed on {router_name}. Changes:\n{diff}"
-                                    
-                        except Exception as e:
-                            # If anything fails, rollback and unlock
-                            try:
-                                config_util.rollback()
-                                config_util.unlock()
-                            except:
-                                pass
-                            result = f"Failed to load/commit configuration: {e}"
-                            
-            except ConnectError as ce:
-                result = f"Connection error to {router_name}: {ce}"
-            except Exception as e:
-                result = f"An error occurred: {e}"
+                        return f"Error: Unsupported config format '{config_format}'. Use 'set', 'text', or 'xml'"
+
+                    diff = config_util.diff()
+                    if not diff:
+                        return "No configuration changes detected"
+
+                    config_util.commit(comment=commit_comment, timeout=timeout)
+                    return f"Configuration successfully loaded and committed on {router_name}. Changes:\n{diff}"
+                except Exception as e:
+                    with suppress(Exception):
+                        config_util.rollback()
+                    return f"Failed to load/commit configuration: {e}"
+                finally:
+                    with suppress(Exception):
+                        config_util.unlock()
+
+            if pool is not None and pool.enabled:
+                junos_device = await pool.get_connection(router_name)
+                try:
+                    junos_device.timeout = timeout
+                    result = await anyio.to_thread.run_sync(lambda: _commit_logic(junos_device), limiter=thread_limiter)
+                except ConnectError as ce:
+                    await pool.invalidate_connection(router_name)
+                    result = f"Connection error to {router_name}: {ce}"
+                except Exception as e:
+                    await pool.invalidate_connection(router_name)
+                    result = f"An error occurred: {e}"
+                finally:
+                    await pool.release_connection(router_name)
+            else:
+                def _direct_commit() -> str:
+                    with Device(**connect_params) as junos_device:
+                        junos_device.timeout = timeout
+                        return _commit_logic(junos_device)
+
+                try:
+                    result = await anyio.to_thread.run_sync(_direct_commit, limiter=thread_limiter)
+                except ConnectError as ce:
+                    result = f"Connection error to {router_name}: {ce}"
+                except Exception as e:
+                    result = f"An error occurred: {e}"
     
     content_block = types.TextContent(
         type="text",
@@ -1419,19 +4262,23 @@ async def handle_load_and_commit_config(arguments: dict, context: Context) -> li
 TOOL_HANDLERS = {
     "execute_junos_command": handle_execute_junos_command,
     "execute_junos_command_batch": handle_execute_junos_command_batch,
+    "execute_junos_commands_batch": handle_execute_junos_commands_batch,
     "get_junos_config": handle_get_junos_config,
     "junos_config_diff": handle_junos_config_diff,
     "render_and_apply_j2_template": handle_render_and_apply_j2_template,
     "gather_device_facts": handle_gather_device_facts,
     "get_router_list": handle_get_router_list,
     "load_and_commit_config": handle_load_and_commit_config,
-    "add_device": handle_add_device     # Dynamic device management
+    "add_device": handle_add_device,     # Dynamic device management
+    "read_artifact": handle_read_artifact,
+    "list_artifacts": handle_list_artifacts,
+    "get_server_settings": handle_get_server_settings,
 }
 
 
 def create_mcp_server() -> Server:
     """Create and configure the MCP server with all tools"""
-    app = Server(JUNOS_MCP, version="1.0.0")
+    app = Server(JUNOS_MCP, version="1.1.0")
     
     @app.call_tool()
     async def call_tool(name: str, arguments: dict) -> list[types.ContentBlock]:
@@ -1474,6 +4321,11 @@ def create_mcp_server() -> Server:
                     "properties": {
                         "router_name": {"type": "string", "description": "The name of the router"},
                         "command": {"type": "string", "description": "The command to execute on the router"},
+                        "format": {
+                            "type": "string",
+                            "description": "Output format: text (default), json, or xml",
+                            "enum": ["text", "json", "xml"]
+                        },
                         "timeout": {"type": "integer", "description": "Command timeout in seconds", "default": 360}
                     },
                     "required": ["router_name", "command"]
@@ -1491,9 +4343,228 @@ def create_mcp_server() -> Server:
                             "description": "List of router names to execute the command on"
                         },
                         "command": {"type": "string", "description": "The command to execute on all routers"},
-                        "timeout": {"type": "integer", "description": "Command timeout in seconds per router", "default": 360}
+                        "format": {
+                            "type": "string",
+                            "description": "Output format for the CLI command: text (default), json, or xml",
+                            "enum": ["text", "json", "xml"]
+                        },
+                        "timeout": {"type": "integer", "description": "Command timeout in seconds per router", "default": 360},
+                        "connection_mode": {
+                            "type": "string",
+                            "description": "Connection strategy per router: pooled (default) uses the connection pool when enabled; fresh always opens a new session per router",
+                            "enum": ["pooled", "fresh"],
+                            "default": "pooled"
+                        },
+                        "auto_fallback_to_fresh": {
+                            "type": "boolean",
+                            "description": "When connection_mode=pooled: if a pooled attempt fails with transport/timeout, invalidate and retry once using a fresh session. If omitted, the server chooses a safe default (typically enabled for 'show' commands)."
+                        },
+                        "barrier_sync": {
+                            "type": "boolean",
+                            "description": "If true: preconnect to routers first, then (optionally) run the command only on routers with established sessions",
+                            "default": False
+                        },
+                        "barrier_policy": {
+                            "type": "string",
+                            "description": "Barrier behavior when some routers fail preconnect: proceed (run on connected subset) or strict (abort execution)",
+                            "enum": ["proceed", "strict"],
+                            "default": "proceed"
+                        },
+                        "preconnect_timeout": {
+                            "type": "integer",
+                            "description": "Timeout in seconds for each router preconnect attempt",
+                            "default": 30
+                        },
+                        "preconnect_retries": {
+                            "type": "integer",
+                            "description": "Number of retries for router preconnect failures (0 means no retry)",
+                            "default": 2
+                        },
+                        "preconnect_backoff_seconds": {
+                            "type": "integer",
+                            "description": "Seconds to wait between preconnect retries",
+                            "default": 1
+                        },
+                        "response_mode": {
+                            "type": "string",
+                            "description": "Response size mode: full (include all outputs), summary (only failures/metadata), artifact (persist full results to configured artifact backend and return only summary+pointer)",
+                            "enum": ["full", "summary", "artifact"]
+                        },
+                        "persist_to_disk": {
+                            "type": "boolean",
+                            "description": "If true, persist full results to the configured artifact backend and include an artifact pointer in the response",
+                            "default": False
+                        },
+                        "persist_to_redis": {
+                            "type": "boolean",
+                            "description": "If true, persist full results to the configured artifact backend (use with artifact_backend=redis/dual); kept for convenience",
+                            "default": False
+                        },
+                        "artifact_backend": {
+                            "type": "string",
+                            "description": "Artifact storage backend: disk (files), redis (Redis), dual (both; Redis primary)",
+                            "enum": ["disk", "redis", "dual"]
+                        },
+                        "artifact_label": {"type": "string", "description": "Optional short label added to the artifact filename"},
+                        "artifact_dir": {"type": "string", "description": "Optional directory to store artifacts (defaults to JMCP_ARTIFACT_DIR or <jmcp.py dir>/artifacts)"}
                     },
                     "required": ["router_names", "command"]
+                }
+            ),
+            types.Tool(
+                name="execute_junos_commands_batch",
+                description="Execute multiple Junos commands on multiple routers in parallel. This tool batches N commands to M routers in one MCP request, reducing overhead while benefiting from connection pool reuse. Each router executes all commands sequentially, but routers are processed in parallel. Ideal for running the same set of commands across multiple devices.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "router_names": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Array of router names to execute commands on"
+                        },
+                        "commands": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Array of commands to execute on each router"
+                        },
+                        "format": {
+                            "type": "string",
+                            "description": "Output format for all CLI commands in this batch: text (default), json, or xml",
+                            "enum": ["text", "json", "xml"]
+                        },
+                        "timeout": {"type": "integer", "description": "Command timeout in seconds per command", "default": 360},
+                        "connection_mode": {
+                            "type": "string",
+                            "description": "Connection strategy per router: pooled (default) uses the connection pool when enabled; fresh always opens a new session per router",
+                            "enum": ["pooled", "fresh"],
+                            "default": "pooled"
+                        },
+                        "auto_fallback_to_fresh": {
+                            "type": "boolean",
+                            "description": "When connection_mode=pooled: if a pooled attempt fails with transport/timeout, invalidate and retry once using a fresh session. If omitted, the server chooses a safe default (typically enabled for 'show' commands)."
+                        },
+                        "barrier_sync": {
+                            "type": "boolean",
+                            "description": "If true: preconnect to routers first, then (optionally) run commands only on routers with established sessions",
+                            "default": False
+                        },
+                        "barrier_policy": {
+                            "type": "string",
+                            "description": "Barrier behavior when some routers fail preconnect: proceed (run on connected subset) or strict (abort execution)",
+                            "enum": ["proceed", "strict"],
+                            "default": "proceed"
+                        },
+                        "preconnect_timeout": {
+                            "type": "integer",
+                            "description": "Timeout in seconds for each router preconnect attempt",
+                            "default": 30
+                        },
+                        "preconnect_retries": {
+                            "type": "integer",
+                            "description": "Number of retries for router preconnect failures (0 means no retry)",
+                            "default": 2
+                        },
+                        "preconnect_backoff_seconds": {
+                            "type": "integer",
+                            "description": "Seconds to wait between preconnect retries",
+                            "default": 1
+                        },
+                        "response_mode": {
+                            "type": "string",
+                            "description": "Response size mode: full (include all outputs), summary (only failures/metadata), artifact (persist full results to configured artifact backend and return only summary+pointer)",
+                            "enum": ["full", "summary", "artifact"]
+                        },
+                        "persist_to_disk": {
+                            "type": "boolean",
+                            "description": "If true, persist full results to the configured artifact backend and include an artifact pointer in the response",
+                            "default": False
+                        },
+                        "persist_to_redis": {
+                            "type": "boolean",
+                            "description": "If true, persist full results to the configured artifact backend (use with artifact_backend=redis/dual); kept for convenience",
+                            "default": False
+                        },
+                        "artifact_backend": {
+                            "type": "string",
+                            "description": "Artifact storage backend: disk (files), redis (Redis), dual (both; Redis primary)",
+                            "enum": ["disk", "redis", "dual"]
+                        },
+                        "artifact_label": {"type": "string", "description": "Optional short label added to the artifact filename"},
+                        "artifact_dir": {"type": "string", "description": "Optional directory to store artifacts (defaults to JMCP_ARTIFACT_DIR or <jmcp.py dir>/artifacts)"}
+                    },
+                    "required": ["router_names", "commands"]
+                }
+            ),
+            types.Tool(
+                name="read_artifact",
+                description="Read a persisted JMCP artifact by path (disk) or run_id (disk/redis/dual). Supports compact views (metadata/summary/failures) to avoid huge responses.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "artifact_path": {"type": "string", "description": "Absolute or relative path to the artifact JSON"},
+                        "run_id": {"type": "string", "description": "Artifact run_id (resolved via configured backend; disk uses artifact_dir lookup)"},
+                        "artifact_dir": {"type": "string", "description": "Optional artifact directory for run_id lookup"},
+                        "artifact_backend": {
+                            "type": "string",
+                            "description": "Artifact backend to read from when using run_id",
+                            "enum": ["disk", "redis", "dual"]
+                        },
+                        "router_names": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Optional: return only these routers from the artifact (useful for token-safe chunked reads)"
+                        },
+                        "router_offset": {
+                            "type": "integer",
+                            "description": "Optional: return routers starting at this offset (0-based) when router_names is not provided"
+                        },
+                        "router_limit": {
+                            "type": "integer",
+                            "description": "Optional: return at most this many routers when router_names is not provided"
+                        },
+                        "mode": {
+                            "type": "string",
+                            "description": "View mode: metadata, summary, failures, diff, full",
+                            "enum": ["metadata", "summary", "failures", "diff", "full"],
+                            "default": "full"
+                        },
+                        "max_output_chars": {"type": "integer", "description": "Max characters to include per output snippet in failures mode", "default": 4000},
+                        "diff_include_diffs": {"type": "boolean", "description": "diff mode: if true, force unified diffs; if false, disable diffs; if omitted, server uses auto heuristics (may suppress rewrite diffs or oversized diffs)"},
+                        "diff_context_lines": {"type": "integer", "description": "diff mode: unified diff context lines", "default": 10},
+                        "diff_max_diff_chars": {"type": "integer", "description": "diff mode: max characters for each diff text", "default": 3000},
+                        "diff_max_routers_per_group": {"type": "integer", "description": "diff mode: max router names to list per variant group", "default": 10},
+                        "diff_max_groups": {"type": "integer", "description": "diff mode: max variant groups to include (and optionally diff) vs baseline", "default": 3}
+                    },
+                    "required": []
+                }
+            ),
+            types.Tool(
+                name="list_artifacts",
+                description="List persisted JMCP artifacts from the configured backend (disk/redis/dual), optionally filtered by tool/label and time.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "artifact_dir": {"type": "string", "description": "Optional artifact directory (defaults to JMCP_ARTIFACT_DIR or <jmcp.py dir>/artifacts)"},
+                        "artifact_backend": {
+                            "type": "string",
+                            "description": "Artifact backend to list from",
+                            "enum": ["disk", "redis", "dual"]
+                        },
+                        "tool": {"type": "string", "description": "Filter by tool name, e.g. execute_junos_commands_batch"},
+                        "label_contains": {"type": "string", "description": "Filter by substring match on artifact label"},
+                        "since": {"type": "string", "description": "Only include artifacts modified since this ISO8601 timestamp (UTC assumed if no timezone)"},
+                        "limit": {"type": "integer", "description": "Max artifacts to return (max 500)", "default": 50}
+                    },
+                    "required": []
+                }
+            ),
+            types.Tool(
+                name="get_server_settings",
+                description="Return current JMCP server settings (workers, response mode, artifact backend/dir, pool status).",
+                inputSchema={
+                    "type": "object",
+                    "properties": {},
+                    "required": []
                 }
             ),
             types.Tool(
@@ -1591,19 +4662,278 @@ def create_mcp_server() -> Server:
 
 
 def main():
-    # Create the parser
-    parser = argparse.ArgumentParser(description="Junos MCP Server")
+    global MAX_WORKERS, thread_limiter, WORKERS_PER_CORE
     
-    # Add the arguments
-    parser.add_argument('-f', '--device-mapping', default="devices.json", type=str, help='the name of the JSON file containing the device mapping')
-    parser.add_argument('-H', '--host', default="127.0.0.1", type=str, help='Junos MCP Server host')
-    parser.add_argument('-t', '--transport', default="streamable-http", type=str, help='Junos MCP Server transport')
-    parser.add_argument('-p', '--port', default=30030, type=int, help='Junos MCP Server port')
+    # Create the parser
+    parser = argparse.ArgumentParser(
+        description="Junos MCP Server - Model Context Protocol server for Junos automation",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+BASIC USAGE:
+    python jmcp.py                              # Start with defaults (ceil(cpu*1.5) workers, connection pool ON)
+  python jmcp.py -p 8080                      # Use custom port
+  python jmcp.py -f my_routers.json           # Use different device file
+
+WORKER POOL TUNING:
+    python jmcp.py                              # Default: ceil(cpu_cores*1.5) workers (floor=8, cap=80)
+    python jmcp.py --workers-per-core 2         # Scale with CPU cores (cores × factor)
+
+CONNECTION POOL OPTIONS:
+  python jmcp.py --idle-timeout 600           # Keep connections alive 10 minutes
+  python jmcp.py --health-check-interval 60   # Health check every 60 seconds
+  python jmcp.py --disable-connection-pool    # Disable pooling (NOT RECOMMENDED - 100x slower!)
+
+PRODUCTION EXAMPLES:
+  # Small deployment (20-30 routers)
+    python jmcp.py -p 30030                     # Start with defaults
+    python jmcp.py -p 30030 --workers-per-core 2
+  
+  # Medium deployment (45-75 routers)
+    python jmcp.py -p 30030 --workers-per-core 3 --idle-timeout 600
+  
+  # Large deployment (100+ routers)
+    python jmcp.py -p 30030 --workers-per-core 4 --idle-timeout 900 --health-check-interval 120
+
+TROUBLESHOOTING:
+  python jmcp.py --disable-connection-pool    # If seeing connection issues
+    python jmcp.py --workers-per-core 2         # Lower concurrency if system constrained
+
+CONFIGURATION:
+        Thread Pool: Defaults to ceil(cpu_cores*1.5) workers (floor=8, cap=80) to avoid overload on shared hosts
+  Connection Pool: ENABLED by default (15-100x faster batch operations)
+    Priority: --workers-per-core CLI > default (ceil(cpu*1.5))
+
+TCP SESSION BEHAVIOR:
+  
+  EXAMPLE PROMPT: "on all routers get show version and show system uptime"
+  
+  BATCH TOOL OPTIONS:
+    • execute_junos_command_batch: N routers, 1 command (all get same command)
+    • execute_junos_commands_batch: N routers, N commands (all get same command set)
+  
+  WITH CONNECTION POOL (default - RECOMMENDED):
+    50 routers, 12 commands each (execute_junos_commands_batch):
+    
+    Router 1-50: All execute in PARALLEL
+      Each router: TCP Session opens → authenticate
+                   ├─ cmd1 (uses session)
+                   ├─ cmd2 (REUSES session)
+                   ...
+                   └─ cmd12 (REUSES session)
+                   Session kept alive for 300 seconds
+    
+    Result:
+    • Total TCP sessions: 50 (1 per router)
+    • Sessions reused: YES (12 times per router)
+    • TIME_WAIT sockets: Only 50 (when idle timeout expires)
+    • Total time: 2.3 seconds (parallel execution!)
+    • Throughput: 262 commands/second
+    • Token usage: ~53K tokens for 600 operations
+  
+  WITHOUT CONNECTION POOL (--disable-connection-pool):
+    50 routers, 12 commands each:
+    
+    Each router: 12 separate sessions (connect, auth, command, close)
+    
+    Result:
+    • Total TCP sessions: 600 (new connection per command!)
+    • Reconnection overhead: ~1-2 seconds × 600
+    • TIME_WAIT sockets: 600 immediately
+    • Speed: SLOW (reconnect between every command)
+  
+  KEY INSIGHTS:
+    • Pool works PER ROUTER, not per batch
+    • 1 router + 20 commands = 1 TCP session (reused 20 times)
+    • 50 routers + 12 commands = 50 sessions (1 per router, each reused 12 times)
+    • Session stays alive until idle timeout (default: 300s)
+    • Batch processing: All routers execute in parallel (not sequential)
+  
+  EXECUTION MODEL:
+    • PARALLEL across routers: All 50 routers execute simultaneously
+    • SEQUENTIAL per router: Each router's commands run one-by-one
+    • Total time ≈ time for commands on slowest router (NOT 50×12×time)
+    • Pool eliminates reconnections between commands (15-100x faster!)
+
+ARTIFACT STORAGE (via Environment Variables):
+  
+  Artifacts enable storing large command outputs (configs, routing tables) separately
+  to reduce token consumption and improve performance. Controlled via ENV VARS, not CLI args.
+  
+  BASIC ARTIFACT CONFIGURATION:
+    # Set artifact backend (options: "disk", "redis", "none")
+    export JMCP_ARTIFACT_BACKEND=redis
+    
+    # Set default response mode for batch operations
+    export JMCP_BATCH_RESPONSE_MODE=artifact
+    
+    # Then start server normally
+    python jmcp.py -p 30031
+  
+  REDIS CONFIGURATION:
+    # Connection via URL (highest priority)
+    export JMCP_ARTIFACT_REDIS_URL=redis://localhost:6379/0
+    
+    # OR via individual parameters
+    export JMCP_ARTIFACT_REDIS_HOST=127.0.0.1
+    export JMCP_ARTIFACT_REDIS_PORT=6379
+    export JMCP_ARTIFACT_REDIS_DB=0
+    
+    # Optional Redis authentication
+    export JMCP_ARTIFACT_REDIS_USERNAME=myuser
+    export JMCP_ARTIFACT_REDIS_PASSWORD=mypass
+    
+    # Optional Redis tuning
+    export JMCP_ARTIFACT_REDIS_PREFIX=jmcp:           # Key prefix (default: none)
+    export JMCP_ARTIFACT_REDIS_TTL_SECONDS=604800     # 7 days (default)
+    export JMCP_ARTIFACT_REDIS_MAX_BYTES=10000000     # Max artifact size
+    export JMCP_ARTIFACT_REDIS_RESERVE_BYTES=5000000  # Reserved space (default)
+    export JMCP_ARTIFACT_GZIP=true                    # Enable compression
+  
+  DISK CONFIGURATION:
+    export JMCP_ARTIFACT_BACKEND=disk
+    export JMCP_ARTIFACT_DISK_DIR=./artifacts         # Storage directory (default)
+    export JMCP_ARTIFACT_GZIP=true                    # Enable compression
+  
+  FAIL-CLOSED MODE:
+    export JMCP_ARTIFACT_FAIL_CLOSED=true  # Reject requests if artifact storage fails
+  
+  TOOL ARGUMENT OVERRIDE:
+    Tool calls can override per-request:
+    {
+      "name": "execute_junos_command_batch",
+      "arguments": {
+        "router_names": ["r1", "r2"],
+        "command": "show configuration",
+        "response_mode": "artifact",      # Options: "inline", "artifact", "auto"
+        "artifact_backend": "redis",      # Override JMCP_ARTIFACT_BACKEND
+        "persist_to_redis": true          # Force persist to Redis
+      }
+    }
+  
+  TYPICAL WORKFLOW:
+    1. Start Redis: redis-server
+    2. Configure environment:
+       export JMCP_ARTIFACT_BACKEND=redis
+       export JMCP_BATCH_RESPONSE_MODE=artifact
+    3. Start server: python jmcp.py -p 30031
+    4. Large outputs stored in Redis, only metadata returned
+    5. Retrieve via read_artifact tool using artifact_id
+  
+  WHEN TO USE ARTIFACTS:
+    ✓ Large configurations (show configuration | display inheritance)
+    ✓ Routing tables (show route extensive)
+    ✓ Batch operations with 20+ routers
+    ✓ Repeated data retrieval (cache-friendly)
+    ✗ Small outputs (show version)
+    ✗ Single router queries (overhead not worth it)
+        """
+    )
+    
+    # Device configuration
+    parser.add_argument(
+        '-f', '--device-mapping',
+        default="devices.json",
+        type=str,
+        help='JSON file containing device mappings (default: devices.json)'
+    )
+    
+    # Server configuration
+    parser.add_argument(
+        '-H', '--host',
+        default="127.0.0.1",
+        type=str,
+        help='Server host address (default: 127.0.0.1)'
+    )
+    
+    parser.add_argument(
+        '-t', '--transport',
+        default="streamable-http",
+        type=str,
+        choices=['streamable-http', 'stdio'],
+        help='Transport protocol (default: streamable-http)'
+    )
+    
+    parser.add_argument(
+        '-p', '--port',
+        default=30030,
+        type=int,
+        help='Server port number (default: 30030)'
+    )
+    
+    # Thread pool configuration
+    parser.add_argument(
+        '--workers-per-core',
+        type=float,
+        default=None,
+        help='Workers per CPU core (optional). If set, total workers = ceil(cores * factor). If omitted, default is heuristic ceil(cpu*1.5) (floor=8, cap=80).'
+    )
+    
+    # Connection pool configuration
+    parser.add_argument(
+        '--disable-connection-pool',
+        action='store_true',
+        help='Disable persistent connection pool (not recommended - 15-100x slower)'
+    )
+    
+    parser.add_argument(
+        '--idle-timeout',
+        type=int,
+        default=300,
+        help='Connection pool idle timeout in seconds (default: 300). Pool enabled by default'
+    )
+    
+    parser.add_argument(
+        '--health-check-interval',
+        type=int,
+        default=30,
+        help='Connection pool health check interval in seconds (default: 30). Pool enabled by default'
+    )
+    
+    parser.add_argument(
+        '--max-commands-per-connection',
+        type=int,
+        default=5,
+        help='Max commands per TCP session before forcing reconnect (default: 5, prevents stale connections)'
+    )
 
     
     # Parse the arguments
     args = parser.parse_args()
     global devices
+    global connection_pool
+    
+    # Initialize thread pool.
+    # Priority: JMCP_MAX_WORKERS env var (absolute) > --workers-per-core CLI arg > default heuristic (ceil(cpu*1.5), floor=8, cap=80)
+    cpu_cores = os.cpu_count() or 4
+    env_max_workers = os.getenv("JMCP_MAX_WORKERS")
+    if env_max_workers is not None and env_max_workers.strip():
+        if args.workers_per_core is not None:
+            log.warning(
+                "JMCP_MAX_WORKERS is set; ignoring --workers-per-core=%s",
+                args.workers_per_core,
+            )
+        try:
+            MAX_WORKERS = int(env_max_workers.strip())
+        except ValueError as e:
+            raise ValueError("JMCP_MAX_WORKERS must be an integer") from e
+        if MAX_WORKERS <= 0:
+            raise ValueError("JMCP_MAX_WORKERS must be > 0")
+        WORKERS_PER_CORE = None
+        log.info(f"Thread pool configured via JMCP_MAX_WORKERS absolute override: MAX_WORKERS={MAX_WORKERS}")
+    else:
+        WORKERS_PER_CORE = args.workers_per_core
+        if args.workers_per_core is None:
+            MAX_WORKERS = _default_max_workers()
+            log.info(f"Thread pool defaulting to heuristic limit: MAX_WORKERS={MAX_WORKERS}")
+        else:
+            if args.workers_per_core <= 0:
+                raise ValueError("--workers-per-core must be > 0")
+            MAX_WORKERS = int(math.ceil(cpu_cores * args.workers_per_core))
+            log.info(
+                f"Thread pool configured: {cpu_cores} cores × {args.workers_per_core} workers/core = {MAX_WORKERS} total workers (ceil)"
+            )
+    
+    thread_limiter = CapacityLimiter(MAX_WORKERS)
     
     # Check if authentication should be enabled
     auth_enabled = False
@@ -1646,6 +4976,16 @@ def main():
         print(f"Device configuration validation failed: {e}")
         sys.exit(1)
 
+    # Initialize global connection pool (enabled by default)
+    connection_pool = JunosConnectionPool(
+        devices_map=devices,
+        prepare_connection_params_func=prepare_connection_params,
+        max_idle_time=args.idle_timeout,
+        health_check_interval=args.health_check_interval,
+        max_commands_per_connection=args.max_commands_per_connection,
+        enabled=not args.disable_connection_pool
+    )
+
     # Set up signal handler for clean shutdown
     def signal_handler(sig, frame):
         print("\nShutting down MCP server...")
@@ -1662,21 +5002,33 @@ def main():
         if args.transport == 'stdio':
             
             async def run_stdio():
+                if connection_pool is not None:
+                    await connection_pool.start()
                 async with stdio_server() as (read_stream, write_stream):
-                    await mcp_server.run(
-                        read_stream,
-                        write_stream,
-                        mcp_server.create_initialization_options()
-                    )
+                    try:
+                        await mcp_server.run(
+                            read_stream,
+                            write_stream,
+                            mcp_server.create_initialization_options()
+                        )
+                    finally:
+                        if connection_pool is not None:
+                            await connection_pool.stop()
             
             anyio.run(run_stdio)
         elif args.transport == 'streamable-http':
             # For streamable-http, create Starlette app with session manager
             async def run_streamable_http():
+                stateless_mode = get_stateless_with_fallback(default=False)
                 session_manager = StreamableHTTPSessionManager(
                     app=mcp_server,
                     event_store=None,  # No persistence
-                    stateless=False  # Keep sessions alive for elicitation!
+                    stateless=stateless_mode
+                )
+
+                log.info(
+                    f"Streamable HTTP session mode: {'stateless' if stateless_mode else 'stateful'} "
+                    f"(controlled by JMCP_STATELESS, default false)"
                 )
                 
                 # ASGI handler
@@ -1691,9 +5043,15 @@ def main():
                 # Create Starlette app
                 async def lifespan(app):
                     async with session_manager.run():
-                        log.info(f"Streamable HTTP server started on http://{args.host}:{args.port}")
-                        yield
-                        log.info("Server shutting down...")
+                        if connection_pool is not None:
+                            await connection_pool.start()
+                        try:
+                            log.info(f"Streamable HTTP server started on http://{args.host}:{args.port}")
+                            yield
+                            log.info("Server shutting down...")
+                        finally:
+                            if connection_pool is not None:
+                                await connection_pool.stop()
                 
                 starlette_app = Starlette(
                     routes=[Mount("/mcp", app=handle_streamable_http)],

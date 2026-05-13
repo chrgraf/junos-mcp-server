@@ -42,9 +42,9 @@ COPY jmcp_token_manager.py .
 COPY utils/ ./utils/
 
 # Copy test files
-COPY test_config_validation.py .
-COPY test_invalid_devices.json .
-COPY test_junos_cli.py .
+COPY tools/test_config_validation.py .
+COPY tools/fixtures/test_invalid_devices.json .
+COPY tools/test_junos_cli.py .
 
 # Copy configuration files
 # COPY devices.json /app/config/devices.json
