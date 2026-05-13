@@ -91,6 +91,7 @@ class ArtifactStore:
         *,
         tool: str | None = None,
         label_contains: str | None = None,
+        router_contains: str | None = None,
         since_epoch: float | None = None,
         limit: int = 50,
     ) -> list[dict[str, Any]]:
@@ -189,6 +190,7 @@ class DiskArtifactStore(ArtifactStore):
         *,
         tool: str | None = None,
         label_contains: str | None = None,
+        router_contains: str | None = None,
         since_epoch: float | None = None,
         limit: int = 50,
     ) -> list[dict[str, Any]]:
@@ -272,6 +274,9 @@ class RedisArtifactStore(ArtifactStore):
     def _index_tool_key(self, tool: str) -> str:
         return self._k(f"index:tool:{tool}")
 
+    def _index_router_latest_key(self) -> str:
+        return self._k("index:router:latest")
+
     def _maybe_check_limits(self, to_store_bytes: int) -> None:
         if self._max_bytes is not None and to_store_bytes > self._max_bytes:
             raise ArtifactTooLargeError(
@@ -319,6 +324,20 @@ class RedisArtifactStore(ArtifactStore):
             **payload,
         }
 
+        # Extract router names for per-router index.
+        # Payload may use 'routers' (multi-command batch) or 'results' (single-command
+        # batch). Both contain dicts with a 'router_name' key.
+        _router_names: list[str] = []
+        for _rtr in enriched.get("routers") or []:
+            _rname = _rtr.get("router_name") if isinstance(_rtr, dict) else None
+            if isinstance(_rname, str) and _rname:
+                _router_names.append(_rname)
+        if not _router_names:
+            for _r in enriched.get("results") or []:
+                _rname = _r.get("router_name") if isinstance(_r, dict) else None
+                if isinstance(_rname, str) and _rname:
+                    _router_names.append(_rname)
+
         json_bytes = json.dumps(enriched, indent=2, ensure_ascii=False).encode("utf-8")
         sha256 = hashlib.sha256(json_bytes).hexdigest()
 
@@ -350,6 +369,12 @@ class RedisArtifactStore(ArtifactStore):
         )
         pipe.zadd(self._index_time_key(), {run_id: now_ms})
         pipe.zadd(self._index_tool_key(tool_name), {run_id: now_ms})
+        if _router_names:
+            router_latest_key = self._index_router_latest_key()
+            pipe.hset(
+                router_latest_key,
+                mapping={rn: run_id for rn in _router_names},
+            )
 
         if self._ttl_seconds > 0:
             pipe.expire(blob_key, self._ttl_seconds)
@@ -357,6 +382,11 @@ class RedisArtifactStore(ArtifactStore):
             # Index TTL is optional; keep it aligned to reduce leak.
             pipe.expire(self._index_time_key(), self._ttl_seconds)
             pipe.expire(self._index_tool_key(tool_name), self._ttl_seconds)
+            # Keep the router-latest HASH alive at least as long as the blobs.
+            # No TTL would be preferable (so the index outlives expired blobs),
+            # but we follow the project convention of aligning TTLs.
+            if _router_names:
+                pipe.expire(self._index_router_latest_key(), self._ttl_seconds)
 
         pipe.execute()
 
@@ -400,19 +430,33 @@ class RedisArtifactStore(ArtifactStore):
         *,
         tool: str | None = None,
         label_contains: str | None = None,
+        router_contains: str | None = None,
         since_epoch: float | None = None,
         limit: int = 50,
     ) -> list[dict[str, Any]]:
         limit = max(1, limit)
         max_items = min(limit * 5, 2000)  # give room for label filtering
 
-        zkey = self._index_tool_key(tool) if tool else self._index_time_key()
+        # If router_contains is set, use the per-router index for O(1) candidate lookup.
+        if router_contains:
+            raw_map = self._redis.hgetall(self._index_router_latest_key())
+            matched_run_ids: list[str] = []
+            for rn_b, rid_b in (raw_map or {}).items():
+                rn = rn_b.decode("utf-8") if isinstance(rn_b, (bytes, bytearray)) else str(rn_b)
+                if router_contains in rn:
+                    rid = rid_b.decode("utf-8") if isinstance(rid_b, (bytes, bytearray)) else str(rid_b)
+                    matched_run_ids.append(rid)
+            if not matched_run_ids:
+                return []
+            run_ids_iter: Iterable[bytes | str] = matched_run_ids
+        else:
+            zkey = self._index_tool_key(tool) if tool else self._index_time_key()
+            min_score: int | str = "-inf"
+            if since_epoch is not None:
+                min_score = int(since_epoch * 1000)
+            run_ids_iter = self._redis.zrevrangebyscore(zkey, "+inf", min_score, start=0, num=max_items)
 
-        min_score = "-inf"
-        if since_epoch is not None:
-            min_score = int(since_epoch * 1000)
-
-        run_ids: list[bytes] = self._redis.zrevrangebyscore(zkey, "+inf", min_score, start=0, num=max_items)
+        run_ids = run_ids_iter  # type: ignore[assignment]
 
         out: list[dict[str, Any]] = []
         for rid_b in run_ids:
@@ -527,15 +571,23 @@ class DualArtifactStore(ArtifactStore):
         *,
         tool: str | None = None,
         label_contains: str | None = None,
+        router_contains: str | None = None,
         since_epoch: float | None = None,
         limit: int = 50,
     ) -> list[dict[str, Any]]:
-        primary = self._primary.list(tool=tool, label_contains=label_contains, since_epoch=since_epoch, limit=limit)
+        primary = self._primary.list(
+            tool=tool,
+            label_contains=label_contains,
+            router_contains=router_contains,
+            since_epoch=since_epoch,
+            limit=limit,
+        )
         if len(primary) >= limit:
             return primary
         secondary = self._secondary.list(
             tool=tool,
             label_contains=label_contains,
+            router_contains=router_contains,
             since_epoch=since_epoch,
             limit=limit,
         )
